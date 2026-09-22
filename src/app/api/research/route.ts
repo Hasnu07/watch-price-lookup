@@ -4,6 +4,10 @@ import {
   searchChrono24ViaReef,
 } from "@/lib/chrono24";
 import {
+  loginTimeDealer,
+  searchTimeDealerForSale,
+} from "@/lib/timedealer";
+import {
   buildEmptyReport,
   type ResearchInput,
   type ResearchReport,
@@ -14,6 +18,7 @@ export const runtime = "nodejs";
 type Body = ResearchInput & {
   reefApiKey?: string;
   autoFetchB2C?: boolean;
+  autoFetchB2B?: boolean;
 };
 
 export async function POST(req: Request) {
@@ -51,18 +56,76 @@ export async function POST(req: Request) {
 
   const apiKey =
     (body.reefApiKey || process.env.REEF_API_KEY || process.env.REEF_KEY || "").trim();
-  const shouldFetch = Boolean(body.autoFetchB2C !== false && apiKey);
+  const shouldFetchB2C = Boolean(body.autoFetchB2C !== false && apiKey);
+  const hasTimeDealerCreds = Boolean(
+    (process.env.TIMEDEALER_PHONE || process.env.TIMEDEALER_USER) &&
+      process.env.TIMEDEALER_PASSWORD,
+  );
+  const shouldFetchB2B = Boolean(body.autoFetchB2B !== false && hasTimeDealerCreds);
 
-  report.feasibility.b2bAuto = false;
-  report.feasibility.b2cAuto = shouldFetch;
+  report.feasibility.b2bAuto = shouldFetchB2B;
+  report.feasibility.b2cAuto = shouldFetchB2C;
   report.feasibility.notes = [
-    "B2B: TimeDealer and dealer groups need your login. Enter prices yourself; quote HKD exactly — never convert.",
-    shouldFetch
-      ? "B2C: Auto-fetching Chrono24 via ReefAPI for lowest / highest world. UAE filter is approximate — verify seller country on Chrono24."
-      : "B2C: Add a ReefAPI key in Settings (or REEF_API_KEY in .env) for auto prices. Until then, use the Chrono24 links and fill in manually.",
+    shouldFetchB2B
+      ? "B2B: Auto-fetched from TimeDealer forsale feed. HKD quotes are kept in HKD — never converted."
+      : "B2B: Add TIMEDEALER_PHONE + TIMEDEALER_PASSWORD in .env.local for auto dealer prices.",
+    shouldFetchB2C
+      ? "B2C: Auto-fetching Chrono24 via ReefAPI for lowest / highest world. Confirm lowest UAE on Chrono24."
+      : "B2C: Add a ReefAPI key in Settings (or REEF_API_KEY in .env) for auto prices.",
   ];
 
-  if (shouldFetch) {
+  if (shouldFetchB2B) {
+    const login = await loginTimeDealer();
+    if (login.error || !login.cookie) {
+      report.feasibility.b2bAuto = false;
+      report.feasibility.notes[0] = `B2B: ${login.error || "TimeDealer login failed"}`;
+    } else {
+      await Promise.all(
+        report.b2b.map(async (entry, index) => {
+          const result = await searchTimeDealerForSale({
+            cookie: login.cookie,
+            reference: report.reference,
+            year: entry.year,
+            month: entry.month,
+          });
+          if (result.error) {
+            report.b2b[index] = {
+              ...entry,
+              notes: result.error,
+            };
+            return;
+          }
+          const hit = result.lowest;
+          if (!hit) {
+            report.b2b[index] = {
+              ...entry,
+              notes: `No forsale hits for ${entry.year} on TimeDealer`,
+            };
+            return;
+          }
+          report.b2b[index] = {
+            ...entry,
+            price: String(hit.price),
+            currency: hit.currency,
+            source: hit.groupName
+              ? `timedealer / ${hit.groupName}`
+              : "timedealer",
+            notes: [
+              hit.releaseDate ? `release ${hit.releaseDate}` : null,
+              hit.senderName ? `dealer ${hit.senderName}` : null,
+              result.listings.length > 1
+                ? `${result.listings.length} forsale comps`
+                : null,
+            ]
+              .filter(Boolean)
+              .join(" · "),
+          };
+        }),
+      );
+    }
+  }
+
+  if (shouldFetchB2C) {
     for (const y of report.yearPlan.yearsToCheck) {
       const bucket = report.b2c.byYear[y];
       if (!bucket) continue;
@@ -91,13 +154,13 @@ export async function POST(req: Request) {
       }
 
       const lowest = pickExtreme(asc.listings, "lowest");
-      const highest = pickExtreme(desc.listings.length ? desc.listings : asc.listings, "highest");
+      const highest = pickExtreme(
+        desc.listings.length ? desc.listings : asc.listings,
+        "highest",
+      );
 
       bucket.lowestWorld.listing = lowest;
       bucket.highestWorld.listing = highest;
-
-      // ReefAPI search has no reliable country filter in the public schema.
-      // We keep UAE as a dedicated Chrono24 deep-link for the team to verify.
       bucket.lowestUae.listing = null;
       bucket.lowestUae.note =
         "Open the UAE Chrono24 link and enter the lowest AE listing — country filter is not available via the data API.";

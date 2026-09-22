@@ -348,9 +348,12 @@ export function ResearchApp() {
             <CardHeader>
               <CardTitle className="text-base">Data connections</CardTitle>
               <CardDescription>
-                Chrono24 blocks server scraping (Cloudflare). Optional ReefAPI
-                key enables auto B2C lowest/highest. TimeDealer still needs your
-                login for B2B.
+                Chrono24 auto B2C uses a ReefAPI key. TimeDealer auto B2B uses
+                phone + password from{" "}
+                <code className="rounded bg-ink/5 px-1">.env.local</code>{" "}
+                (<code className="rounded bg-ink/5 px-1">TIMEDEALER_PHONE</code>,{" "}
+                <code className="rounded bg-ink/5 px-1">TIMEDEALER_PASSWORD</code>
+                ). HKD quotes stay in HKD.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
@@ -521,8 +524,15 @@ export function ResearchApp() {
                 >
                   B2C {report.feasibility.b2cAuto ? "auto" : "manual links"}
                 </Badge>
-                <Badge variant="outline" className="border-ink/15 text-ink/70">
-                  B2B manual
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    report.feasibility.b2bAuto
+                      ? "border-teal-700/30 text-teal-900"
+                      : "border-ink/15 text-ink/70",
+                  )}
+                >
+                  B2B {report.feasibility.b2bAuto ? "auto" : "manual"}
                 </Badge>
               </div>
             </div>
@@ -550,9 +560,9 @@ export function ResearchApp() {
                   <CardHeader>
                     <CardTitle className="text-base">Dealer market</CardTitle>
                     <CardDescription>
-                      Log into TimeDealer with the team email, then check dealer
-                      groups. If a quote is in HKD, keep it in HKD — do not
-                      convert.
+                      {report.feasibility.b2bAuto
+                        ? "Auto-filled from TimeDealer forsale quotes for each comparison year. Edit if a group quote looks better. HKD stays HKD."
+                        : "Log into TimeDealer, then enter dealer quotes below. If a quote is in HKD, keep it in HKD — do not convert."}
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-4">

@@ -30,15 +30,22 @@ npm run dev
 
 Open [http://127.0.0.1:43127](http://127.0.0.1:43127).
 
-### Optional auto B2C
-
-Create `.env.local`:
+### Optional auto B2C (Chrono24)
 
 ```bash
 REEF_API_KEY=your_reefapi_key
 ```
 
-Or paste the key under **Settings** in the UI (stored in the browser only).
+Or paste the key under **Settings** in the UI (browser only).
+
+### Optional auto B2B (TimeDealer)
+
+```bash
+TIMEDEALER_PHONE=+92311…
+TIMEDEALER_PASSWORD=your_password
+```
+
+Phone must be E.164 (e.g. `+923118598189`). Local `03…` Pakistan numbers are accepted and normalized. Quotes in HKD are kept in HKD.
 
 ## Stack
 
