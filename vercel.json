@@ -1,0 +1,2 @@
+# Created by Vercel CLI when you run `vercel` — this locks the framework.
+framework = "nextjs"

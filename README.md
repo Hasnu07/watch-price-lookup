@@ -47,6 +47,45 @@ TIMEDEALER_PASSWORD=your_password
 
 Phone must be E.164 (e.g. `+923118598189`). Local `03…` Pakistan numbers are accepted and normalized. Quotes in HKD are kept in HKD.
 
+## Deploy live
+
+**Best fit:** [Vercel](https://vercel.com) (built for Next.js). **Also fine:** [Railway](https://railway.app) — yes, Railway works well for this app.
+
+### Railway (recommended if you already use it)
+
+1. Create a project at [railway.app](https://railway.app) → **Deploy from GitHub** (connect this repo).
+2. Add variables (Variables tab):
+
+```bash
+REEF_API_KEY=…
+TIMEDEALER_PHONE=+92311…
+TIMEDEALER_PASSWORD=…
+```
+
+3. Deploy. Railway sets `PORT` automatically; `railway.json` is already in the repo.
+4. Generate a public domain under **Settings → Networking**.
+
+CLI alternative:
+
+```bash
+npm i -g @railway/cli
+railway login
+railway init
+railway variables set REEF_API_KEY=… TIMEDEALER_PHONE=… TIMEDEALER_PASSWORD=…
+railway up
+```
+
+### Vercel (simplest for Next.js)
+
+```bash
+npm i -g vercel
+vercel login
+vercel          # preview
+vercel --prod   # live
+```
+
+Add the same env vars in the Vercel project settings.
+
 ## Stack
 
 Next.js · TypeScript · Tailwind · shadcn/ui
