@@ -176,7 +176,7 @@ export async function POST(req: Request) {
       ? "B2B: Auto-fetched from TimeDealer forsale feed. HKD quotes are kept in HKD — never converted."
       : "B2B: Add TIMEDEALER_PHONE + TIMEDEALER_PASSWORD in .env.local for auto dealer prices.",
     shouldFetchB2C
-      ? "B2C: Chrono24 prices are year-verified via listing details. Open links use Chrono24’s year= checkbox."
+      ? "B2C: Chrono24 listing prices (before shipping), year-verified via details. Compare to the Chrono24 card price — not + shipping."
       : "B2C: Add a ReefAPI key in Settings (or REEF_API_KEY in .env) for auto prices.",
   ];
 
