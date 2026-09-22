@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseChrono24Year } from "./chrono24";
+import { parseChrono24Year, sanitizeApiError } from "./chrono24";
 import {
   buildEmptyReport,
   buildYearPlan,
@@ -76,6 +76,17 @@ describe("parseChrono24Year", () => {
       year: 2025,
       approximate: true,
     });
+  });
+});
+
+describe("sanitizeApiError", () => {
+  it("hides Cloudflare HTML bodies", () => {
+    const msg = sanitizeApiError(
+      524,
+      "<!DOCTYPE html><html><body>Cloudflare</body></html>",
+    );
+    assert.match(msg, /timed out/i);
+    assert.doesNotMatch(msg, /DOCTYPE/);
   });
 });
 

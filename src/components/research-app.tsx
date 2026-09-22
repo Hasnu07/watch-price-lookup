@@ -650,10 +650,16 @@ export function ResearchApp() {
               <TabsContent value="b2c" className="space-y-4">
                 {report.feasibility.notes.map((n) => (
                   <Alert
-                    key={n}
-                    className="border-teal-200/80 bg-teal-50/60 text-ink"
+                    key={n.slice(0, 80)}
+                    className={
+                      /timed out|unavailable|error|failed|HTTP/i.test(n)
+                        ? "border-red-200/80 bg-red-50/70 text-ink"
+                        : "border-teal-200/80 bg-teal-50/60 text-ink"
+                    }
                   >
-                    <AlertDescription>{n}</AlertDescription>
+                    <AlertDescription className="break-words text-sm leading-relaxed">
+                      {n.length > 280 ? `${n.slice(0, 280)}…` : n}
+                    </AlertDescription>
                   </Alert>
                 ))}
 
