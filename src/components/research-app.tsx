@@ -265,6 +265,7 @@ export function ResearchApp() {
     year?: number;
     month?: string;
     dial?: string;
+    skipB2B?: boolean;
   }) {
     const ref = (opts?.reference ?? reference).trim();
     const y = opts?.year ?? yearNum;
@@ -297,6 +298,7 @@ export function ResearchApp() {
           dial: dialValue || undefined,
           reefApiKey: reefKey || undefined,
           autoFetchB2C: true,
+          autoFetchB2B: opts?.skipB2B ? false : undefined,
         }),
       });
       const data = (await res.json()) as {
@@ -349,6 +351,7 @@ export function ResearchApp() {
         year: Number(y),
         month: m || "",
         dial: d || "",
+        skipB2B: params.get("b2b") === "0",
       });
     }
     // Deep-link autorun once on mount
