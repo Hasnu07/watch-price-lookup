@@ -193,6 +193,7 @@ export function ResearchApp() {
     }
   });
   const [pending, setPending] = useState(false);
+  const [tab, setTab] = useState("b2c");
   const autoRan = useRef(false);
 
   const yearNum = Number(year);
@@ -329,13 +330,17 @@ export function ResearchApp() {
     const y = params.get("year");
     const m = params.get("month");
     const d = params.get("dial");
+    const tabParam = params.get("tab");
     const autorun = params.get("autorun") === "1";
-    if (!ref && !y && !m && !autorun) return;
+    if (!ref && !y && !m && !autorun && !tabParam) return;
 
     if (ref) setReference(ref);
     if (y) setYear(y);
     if (m) setMonth(m);
     if (d) setDial(d);
+    if (tabParam === "b2b" || tabParam === "b2c" || tabParam === "report") {
+      setTab(tabParam);
+    }
 
     if (autorun && ref && y) {
       autoRan.current = true;
@@ -610,7 +615,7 @@ export function ResearchApp() {
               ))}
             </div>
 
-            <Tabs defaultValue="b2b" className="gap-4">
+            <Tabs value={tab} onValueChange={setTab} className="gap-4">
               <TabsList className="bg-white/60">
                 <TabsTrigger value="b2b">B2B · dealers</TabsTrigger>
                 <TabsTrigger value="b2c">B2C · Chrono24</TabsTrigger>
