@@ -146,12 +146,11 @@ export function chrono24SearchUrl(opts: {
   country?: "AE" | "world";
 }): string {
   const params = new URLSearchParams();
-  params.set("query", opts.reference);
   params.set("dosearch", "true");
-  params.set("searchexplain", "1");
-  // Chrono24 yearManufactured filter
-  params.set("yearManufactured", String(opts.year));
-  // sortorder: 1 = price ascending, 11 = price descending (common Chrono24 values)
+  params.set("query", opts.reference);
+  // Chrono24 Year-of-production checkbox uses repeated `year=` params
+  params.append("year", String(opts.year));
+  // sortorder: 1 = price ascending, 11 = price descending
   if (opts.sort === "lowest") params.set("sortorder", "1");
   if (opts.sort === "highest") params.set("sortorder", "11");
   if (opts.country === "AE") params.set("countryIds", "AE");

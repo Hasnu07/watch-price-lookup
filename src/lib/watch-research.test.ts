@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { parseChrono24Year } from "./chrono24";
 import {
+  buildEmptyReport,
   buildYearPlan,
+  chrono24SearchUrl,
   extractDialHint,
   formatReportText,
-  buildEmptyReport,
   normalizeReference,
 } from "./watch-research";
 
@@ -38,6 +40,42 @@ describe("buildYearPlan", () => {
   it("for 2024 checks 2024 and 2025 only", () => {
     const plan = buildYearPlan(2024);
     assert.deepEqual(plan.yearsToCheck, [2024, 2025]);
+  });
+});
+
+describe("chrono24SearchUrl", () => {
+  it("uses Chrono24 year= checkbox param", () => {
+    const url = chrono24SearchUrl({
+      reference: "7118/1200A-010",
+      year: 2024,
+      sort: "lowest",
+    });
+    assert.match(url, /[?&]year=2024(?:&|$)/);
+    assert.doesNotMatch(url, /yearManufactured/);
+    assert.match(url, /sortorder=1/);
+  });
+
+  it("adds UAE countryIds", () => {
+    const url = chrono24SearchUrl({
+      reference: "7118/1200A-010",
+      year: 2024,
+      sort: "lowest",
+      country: "AE",
+    });
+    assert.match(url, /countryIds=AE/);
+  });
+});
+
+describe("parseChrono24Year", () => {
+  it("parses exact and approximation years", () => {
+    assert.deepEqual(parseChrono24Year("2024"), {
+      year: 2024,
+      approximate: false,
+    });
+    assert.deepEqual(parseChrono24Year("2025 (Approximation)"), {
+      year: 2025,
+      approximate: true,
+    });
   });
 });
 

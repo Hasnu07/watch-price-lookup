@@ -115,6 +115,12 @@ function ListingCellInner({
       <p className="text-lg font-semibold tabular-nums tracking-tight text-ink">
         {money(slice.listing)}
       </p>
+      {slice.listing?.year ? (
+        <p className="text-xs font-medium text-teal-900">
+          Year of production: {slice.listing.year}
+          {slice.listing.location ? ` · ${slice.listing.location}` : ""}
+        </p>
+      ) : null}
       {slice.listing?.title ? (
         <p className="text-xs text-muted-foreground line-clamp-2">
           {slice.listing.title}
