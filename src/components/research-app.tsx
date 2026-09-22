@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -23,13 +23,6 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
@@ -200,6 +193,7 @@ export function ResearchApp() {
     }
   });
   const [pending, setPending] = useState(false);
+  const autoRan = useRef(false);
 
   const yearNum = Number(year);
   const needsMonth = yearNum === 2026;
@@ -265,8 +259,23 @@ export function ResearchApp() {
     });
   }
 
-  async function runResearch() {
-    if (needsMonth && !month) {
+  async function runResearch(opts?: {
+    reference?: string;
+    year?: number;
+    month?: string;
+    dial?: string;
+  }) {
+    const ref = (opts?.reference ?? reference).trim();
+    const y = opts?.year ?? yearNum;
+    const m = opts?.month ?? month;
+    const dialValue = opts?.dial ?? dial;
+    const monthRequired = y === 2026;
+
+    if (!ref) {
+      setError("Reference is required.");
+      return;
+    }
+    if (monthRequired && !m) {
       setError("Month is required for 2026 watches.");
       return;
     }
@@ -281,10 +290,10 @@ export function ResearchApp() {
         headers: { "content-type": "application/json" },
         signal: controller.signal,
         body: JSON.stringify({
-          reference,
-          year: yearNum,
-          month: needsMonth && month ? Number(month) : month ? Number(month) : null,
-          dial: dial || undefined,
+          reference: ref,
+          year: y,
+          month: m ? Number(m) : null,
+          dial: dialValue || undefined,
           reefApiKey: reefKey || undefined,
           autoFetchB2C: true,
         }),
@@ -312,6 +321,34 @@ export function ResearchApp() {
       setPending(false);
     }
   }
+
+  useEffect(() => {
+    if (autoRan.current || typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const ref = params.get("ref") || params.get("reference");
+    const y = params.get("year");
+    const m = params.get("month");
+    const d = params.get("dial");
+    const autorun = params.get("autorun") === "1";
+    if (!ref && !y && !m && !autorun) return;
+
+    if (ref) setReference(ref);
+    if (y) setYear(y);
+    if (m) setMonth(m);
+    if (d) setDial(d);
+
+    if (autorun && ref && y) {
+      autoRan.current = true;
+      void runResearch({
+        reference: ref,
+        year: Number(y),
+        month: m || "",
+        dial: d || "",
+      });
+    }
+    // Deep-link autorun once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function copyReport() {
     if (!reportText) return;
@@ -443,25 +480,19 @@ export function ResearchApp() {
                 <Label htmlFor="month">
                   Month {needsMonth ? "(required for 2026)" : "(optional)"}
                 </Label>
-                <Select
-                  value={month || "none"}
-                  onValueChange={(v) => {
-                    const next = v ?? "none";
-                    setMonth(next === "none" ? "" : next);
-                  }}
+                <select
+                  id="month"
+                  value={month}
+                  onChange={(e) => setMonth(e.target.value)}
+                  className="border-input bg-background h-11 w-full rounded-md border px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
                 >
-                  <SelectTrigger id="month" className="h-11 w-full">
-                    <SelectValue placeholder="—" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">—</SelectItem>
-                    {MONTH_NAMES.map((name, i) => (
-                      <SelectItem key={name} value={String(i + 1)}>
-                        {name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                  <option value="">—</option>
+                  {MONTH_NAMES.map((name, i) => (
+                    <option key={name} value={String(i + 1)}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="space-y-2 lg:col-span-3">
                 <Label htmlFor="dial">Dial (optional override)</Label>
