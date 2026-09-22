@@ -72,7 +72,7 @@ async function fillB2C(report: ResearchReport, apiKey: string): Promise<void> {
     apiKey,
     query: report.reference,
     years: report.yearPlan.yearsToCheck,
-    detailLimit: 8,
+    detailLimit: 28,
   });
 
   if (verified.error) {

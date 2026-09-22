@@ -274,7 +274,7 @@ export function ResearchApp() {
     setCopied(false);
     setPending(true);
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 50_000);
+    const timer = window.setTimeout(() => controller.abort(), 70_000);
     try {
       const res = await fetch("/api/research", {
         method: "POST",
@@ -302,7 +302,7 @@ export function ResearchApp() {
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
         setError(
-          "Research timed out after 50s. B2B may still work on retry — or use Open Chrono24 links for B2C.",
+          "Research timed out after 70s. Retry, or use Open Chrono24 links for B2C.",
         );
       } else {
         setError(e instanceof Error ? e.message : "Network error");
@@ -493,7 +493,7 @@ export function ResearchApp() {
                 </Button>
                 {pending ? (
                   <p className="text-xs text-ink/60">
-                    Checking TimeDealer + Chrono24 — usually under 30s. Stops at 50s.
+                    Checking TimeDealer + Chrono24 — usually under 45s. Stops at 70s.
                   </p>
                 ) : null}
               </div>

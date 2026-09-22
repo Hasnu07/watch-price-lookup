@@ -256,19 +256,10 @@ function isUae(listing: MarketListing): boolean {
   return loc === "AE" || loc === "UAE" || loc.includes("UNITED ARAB");
 }
 
-function yearsCovered(
-  verified: MarketListing[],
-  years: number[],
-): boolean {
-  return years.every((y) =>
-    verified.some((l) => matchesExactYear(l, y, true)),
-  );
-}
-
 /**
- * ReefAPI's search `year` param is unreliable (ignored).
- * We search by reference, then verify Year of production via detail,
- * matching Chrono24's year filter checkbox behaviour.
+ * ReefAPI's `year` filter is ignored, but appending the year to the query
+ * (Chrono24 search bar style: "5726A-001 2026") returns year-relevant hits.
+ * We still verify Year of production via detail before quoting.
  */
 export async function fetchChrono24VerifiedByYears(opts: {
   apiKey: string;
@@ -287,85 +278,90 @@ export async function fetchChrono24VerifiedByYears(opts: {
     };
   }
 
-  // Fast path for hosted deploys: one ascending search + a few details.
-  const asc = await reefSearch({
-    apiKey: opts.apiKey,
-    query: opts.query,
-    sort: "price_asc",
-    attempts: 2,
-  });
+  const maxDetailsPerYear = Math.max(
+    8,
+    Math.floor((opts.detailLimit ?? 24) / Math.max(years.length, 1)),
+  );
 
-  let descListings: MarketListing[] = [];
-  if (!asc.error) {
-    // Only fetch expensive side if we still have time budget conceptually —
-    // one extra search is enough for highs without doubling detail work.
-    const desc = await reefSearch({
-      apiKey: opts.apiKey,
-      query: opts.query,
-      sort: "price_desc",
-      attempts: 1,
-    });
-    if (!desc.error) descListings = desc.listings;
-  }
+  await Promise.all(
+    years.map(async (y) => {
+      const yearQuery = `${opts.query} ${y}`;
+      const [asc, desc] = await Promise.all([
+        reefSearch({
+          apiKey: opts.apiKey,
+          query: yearQuery,
+          sort: "price_asc",
+          attempts: 2,
+        }),
+        reefSearch({
+          apiKey: opts.apiKey,
+          query: yearQuery,
+          sort: "price_desc",
+          attempts: 2,
+        }),
+      ]);
 
-  if (asc.error && !descListings.length) {
-    return { byYear, error: asc.error };
-  }
-
-  const seen = new Set<string>();
-  const candidateIds: string[] = [];
-  const a = asc.listings;
-  const b = descListings;
-  const maxLen = Math.max(a.length, b.length);
-  for (let i = 0; i < maxLen; i++) {
-    for (const item of [a[i], b[i]]) {
-      if (!item || seen.has(item.id)) continue;
-      seen.add(item.id);
-      candidateIds.push(item.id);
-    }
-  }
-
-  const limit = Math.min(opts.detailLimit ?? 8, candidateIds.length);
-  const verified: MarketListing[] = [];
-  const batchSize = 4;
-
-  for (let i = 0; i < limit; i += batchSize) {
-    const batch = candidateIds.slice(i, i + batchSize);
-    const details = await Promise.all(
-      batch.map((id) => reefDetail(opts.apiKey, id)),
-    );
-    for (const d of details) {
-      if (d) verified.push(d);
-    }
-    if (yearsCovered(verified, years) && verified.length >= years.length) {
-      break;
-    }
-  }
-
-  for (const y of years) {
-    let yearListings = verified.filter((l) => matchesExactYear(l, y, false));
-    let note: string | undefined;
-    if (!yearListings.length) {
-      yearListings = verified.filter((l) => matchesExactYear(l, y, true));
-      if (yearListings.length) {
-        note = `Only approximation-year listings found for ${y} after verifying Chrono24 details.`;
+      if (asc.error && desc.error) {
+        byYear[y]!.note = asc.error || desc.error;
+        return;
       }
-    }
 
-    const sorted = [...yearListings].sort((a, b) => a.price - b.price);
-    const uae = sorted.filter(isUae);
-    byYear[y] = {
-      lowestWorld: sorted[0] ?? null,
-      highestWorld: sorted.length ? sorted[sorted.length - 1]! : null,
-      lowestUae: uae[0] ?? null,
-      verifiedCount: yearListings.length,
-      note:
-        note ||
-        (!yearListings.length
-          ? `No Chrono24 listings verified for year ${y} (checked ${verified.length} details). Use the year-filtered Chrono24 link.`
-          : undefined),
-    };
-  }
+      const detailCache = new Map<string, MarketListing | null>();
+      let calls = 0;
+
+      async function detailCached(id: string): Promise<MarketListing | null> {
+        if (detailCache.has(id)) return detailCache.get(id)!;
+        if (calls >= maxDetailsPerYear) return null;
+        calls += 1;
+        const d = await reefDetail(opts.apiKey, id);
+        detailCache.set(id, d);
+        return d;
+      }
+
+      async function firstMatch(
+        listings: MarketListing[],
+        pred: (d: MarketListing) => boolean,
+      ): Promise<MarketListing | null> {
+        const batchSize = 3;
+        for (let i = 0; i < listings.length && calls < maxDetailsPerYear; i += batchSize) {
+          const batch = listings.slice(i, i + batchSize);
+          const details = await Promise.all(batch.map((l) => detailCached(l.id)));
+          for (const d of details) {
+            if (d && matchesExactYear(d, y, false) && pred(d)) return d;
+          }
+        }
+        // Approximation fallback
+        for (let i = 0; i < listings.length && calls < maxDetailsPerYear; i += batchSize) {
+          const batch = listings.slice(i, i + batchSize);
+          const details = await Promise.all(batch.map((l) => detailCached(l.id)));
+          for (const d of details) {
+            if (d && matchesExactYear(d, y, true) && pred(d)) return d;
+          }
+        }
+        return null;
+      }
+
+      const lowestWorld = await firstMatch(asc.listings, () => true);
+      const highestWorld = await firstMatch(desc.listings, () => true);
+      const lowestUae =
+        (lowestWorld && isUae(lowestWorld) ? lowestWorld : null) ||
+        (await firstMatch(asc.listings, isUae));
+
+      const verified = [...detailCache.values()].filter(
+        (d): d is MarketListing => Boolean(d && matchesExactYear(d, y, true)),
+      );
+
+      byYear[y] = {
+        lowestWorld,
+        highestWorld,
+        lowestUae,
+        verifiedCount: verified.length,
+        note: !lowestWorld && !highestWorld
+          ? `No Chrono24 listings verified for year ${y}. Use the year-filtered Chrono24 link.`
+          : `Year ${y} search verified via Chrono24 details. Listing price before shipping.`,
+      };
+    }),
+  );
 
   return { byYear };
 }
