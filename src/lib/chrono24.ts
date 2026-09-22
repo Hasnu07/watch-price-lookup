@@ -125,7 +125,7 @@ async function reefSearch(opts: {
             page: opts.page ?? 1,
           }),
         },
-        45_000,
+        25_000,
       );
 
       if (!res.ok) {
@@ -203,7 +203,7 @@ async function reefDetail(
         },
         body: JSON.stringify({ listing_id: listingId }),
       },
-      25_000,
+      12_000,
     );
     if (!res.ok) return null;
     const json = (await res.json()) as ReefDetailResponse;
@@ -287,33 +287,35 @@ export async function fetchChrono24VerifiedByYears(opts: {
     };
   }
 
-  // Sequential searches reduce provider load vs firing both at once (helps avoid 524).
+  // Fast path for hosted deploys: one ascending search + a few details.
   const asc = await reefSearch({
     apiKey: opts.apiKey,
     query: opts.query,
     sort: "price_asc",
+    attempts: 2,
   });
-  const desc = asc.error
-    ? await reefSearch({
-        apiKey: opts.apiKey,
-        query: opts.query,
-        sort: "price_desc",
-      })
-    : await reefSearch({
-        apiKey: opts.apiKey,
-        query: opts.query,
-        sort: "price_desc",
-      });
 
-  if (asc.error && desc.error) {
-    return { byYear, error: asc.error || desc.error };
+  let descListings: MarketListing[] = [];
+  if (!asc.error) {
+    // Only fetch expensive side if we still have time budget conceptually —
+    // one extra search is enough for highs without doubling detail work.
+    const desc = await reefSearch({
+      apiKey: opts.apiKey,
+      query: opts.query,
+      sort: "price_desc",
+      attempts: 1,
+    });
+    if (!desc.error) descListings = desc.listings;
   }
 
-  // Interleave cheap + expensive candidates so year coverage is better early.
+  if (asc.error && !descListings.length) {
+    return { byYear, error: asc.error };
+  }
+
   const seen = new Set<string>();
   const candidateIds: string[] = [];
   const a = asc.listings;
-  const b = desc.listings;
+  const b = descListings;
   const maxLen = Math.max(a.length, b.length);
   for (let i = 0; i < maxLen; i++) {
     for (const item of [a[i], b[i]]) {
@@ -323,10 +325,9 @@ export async function fetchChrono24VerifiedByYears(opts: {
     }
   }
 
-  // Keep detail volume low on Railway to avoid provider timeouts.
-  const limit = Math.min(opts.detailLimit ?? 16, candidateIds.length);
+  const limit = Math.min(opts.detailLimit ?? 8, candidateIds.length);
   const verified: MarketListing[] = [];
-  const batchSize = 3;
+  const batchSize = 4;
 
   for (let i = 0; i < limit; i += batchSize) {
     const batch = candidateIds.slice(i, i + batchSize);
@@ -336,9 +337,7 @@ export async function fetchChrono24VerifiedByYears(opts: {
     for (const d of details) {
       if (d) verified.push(d);
     }
-    // Early stop once every requested year has at least one verified listing
-    // and we have enough samples for low/high within those years.
-    if (yearsCovered(verified, years) && verified.length >= years.length * 2) {
+    if (yearsCovered(verified, years) && verified.length >= years.length) {
       break;
     }
   }

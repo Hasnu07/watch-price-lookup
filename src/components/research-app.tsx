@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
+import { useMemo, useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -199,7 +199,7 @@ export function ResearchApp() {
       return [];
     }
   });
-  const [pending, startTransition] = useTransition();
+  const [pending, setPending] = useState(false);
 
   const yearNum = Number(year);
   const needsMonth = yearNum === 2026;
@@ -266,36 +266,51 @@ export function ResearchApp() {
   }
 
   async function runResearch() {
+    if (needsMonth && !month) {
+      setError("Month is required for 2026 watches.");
+      return;
+    }
     setError(null);
     setCopied(false);
-    startTransition(async () => {
-      try {
-        const res = await fetch("/api/research", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            reference,
-            year: yearNum,
-            month: needsMonth && month ? Number(month) : null,
-            dial: dial || undefined,
-            reefApiKey: reefKey || undefined,
-            autoFetchB2C: true,
-          }),
-        });
-        const data = (await res.json()) as {
-          report?: ResearchReport;
-          error?: string;
-        };
-        if (!res.ok || !data.report) {
-          setError(data.error || "Research failed");
-          return;
-        }
-        setReport(data.report);
-        pushHistory(data.report.reference, data.report.year);
-      } catch (e) {
+    setPending(true);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 50_000);
+    try {
+      const res = await fetch("/api/research", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          reference,
+          year: yearNum,
+          month: needsMonth && month ? Number(month) : month ? Number(month) : null,
+          dial: dial || undefined,
+          reefApiKey: reefKey || undefined,
+          autoFetchB2C: true,
+        }),
+      });
+      const data = (await res.json()) as {
+        report?: ResearchReport;
+        error?: string;
+      };
+      if (!res.ok || !data.report) {
+        setError(data.error || "Research failed");
+        return;
+      }
+      setReport(data.report);
+      pushHistory(data.report.reference, data.report.year);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        setError(
+          "Research timed out after 50s. B2B may still work on retry — or use Open Chrono24 links for B2C.",
+        );
+      } else {
         setError(e instanceof Error ? e.message : "Network error");
       }
-    });
+    } finally {
+      window.clearTimeout(timer);
+      setPending(false);
+    }
   }
 
   async function copyReport() {
@@ -458,10 +473,15 @@ export function ResearchApp() {
                   className="h-11"
                 />
               </div>
-              <div className="flex items-end lg:col-span-12">
+              <div className="flex flex-col gap-2 lg:col-span-12 sm:flex-row sm:items-center">
                 <Button
                   type="submit"
-                  disabled={pending || !reference.trim() || !yearNum}
+                  disabled={
+                    pending ||
+                    !reference.trim() ||
+                    !yearNum ||
+                    (needsMonth && !month)
+                  }
                   className="h-11 bg-ink text-white hover:bg-ink/90"
                 >
                   {pending ? (
@@ -471,6 +491,11 @@ export function ResearchApp() {
                   )}
                   {pending ? "Researching…" : "Run price check"}
                 </Button>
+                {pending ? (
+                  <p className="text-xs text-ink/60">
+                    Checking TimeDealer + Chrono24 — usually under 30s. Stops at 50s.
+                  </p>
+                ) : null}
               </div>
             </form>
 
