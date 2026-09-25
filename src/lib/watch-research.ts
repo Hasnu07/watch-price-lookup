@@ -33,13 +33,38 @@ export type B2CSlice = {
   note?: string;
 };
 
-export type B2BEntry = {
-  price: string;
+/** One dealer "for sale" quote from the TimeDealer feed. */
+export type B2BQuote = {
+  id: string;
+  reference: string;
+  price: number;
   currency: string;
-  source: string;
+  /** TimeDealer's own USD conversion — display only, never used in the report. */
+  usdPrice: number | null;
+  releaseDate: string | null;
+  /** ISO timestamp of when the dealer posted it. */
+  postedAt: string | null;
+  seller: string | null;
+  sellerPhone: string | null;
+  sellerAvatar: string | null;
+  group: string | null;
+  condition: string | null;
+  color: string | null;
+  note: string | null;
+  image: string | null;
+  verified: boolean;
+  timesPosted: number | null;
+};
+
+export type B2BYear = {
   year: number;
-  month?: number | null;
-  notes?: string;
+  /** Our target month — only set on the row for our own year. */
+  month: number | null;
+  quotes: B2BQuote[];
+  /** Matching quotes before the display cap. */
+  totalFound: number;
+  status: "ok" | "empty" | "error" | "skipped";
+  note?: string;
 };
 
 export type ResearchReport = {
@@ -47,8 +72,9 @@ export type ResearchReport = {
   dial: string;
   year: number;
   month: number | null;
+  generatedAt: string;
   yearPlan: YearPlan;
-  b2b: B2BEntry[];
+  b2b: B2BYear[];
   b2c: {
     byYear: Record<
       number,
@@ -67,7 +93,8 @@ export type ResearchReport = {
   feasibility: {
     b2cAuto: boolean;
     b2bAuto: boolean;
-    notes: string[];
+    b2bNote: string;
+    b2cNote: string;
   };
 };
 
@@ -86,6 +113,9 @@ const MONTH_NAMES = [
   "December",
 ];
 
+/** Quotes per currency listed in the copy-paste report (the UI shows all). */
+const REPORT_QUOTES_PER_CURRENCY = 3;
+
 export function normalizeReference(raw: string): string {
   return raw.trim().replace(/\s+/g, "").toUpperCase();
 }
@@ -98,30 +128,44 @@ export function extractDialHint(reference: string): string {
   return parts[parts.length - 1] ?? "Confirm dial colour from the watch";
 }
 
-export function buildYearPlan(year: number, month?: number | null): YearPlan {
+/**
+ * Comparison years are relative to the current year, so the rules keep
+ * working after a year change:
+ * - current year → check current + previous; month matters for freshness
+ * - previous two years → check those two only (no current-year comps)
+ * - older → that year and the one before
+ */
+export function buildYearPlan(
+  year: number,
+  month?: number | null,
+  currentYear: number = new Date().getFullYear(),
+): YearPlan {
   const rules: string[] = [];
-  let yearsToCheck: number[] = [];
-  const monthMatters = year === 2026;
+  let yearsToCheck: number[];
+  const monthMatters = year === currentYear;
+  const ourMonth = month ?? null;
 
-  if (year === 2026) {
-    yearsToCheck = [2026, 2025];
+  if (year === currentYear) {
+    yearsToCheck = [year, year - 1];
     rules.push(
-      "Our watch is 2026 — search 2026 first, then also check 2025 for the value gap.",
+      `Our watch is ${year} — search ${year} first, then also check ${year - 1} for the value gap.`,
     );
-    rules.push(
-      "Month matters for fresh pieces (especially Patek, Rolex, AP). Prefer listings closest to our month.",
-    );
-    if (month) {
+    if (ourMonth) {
       rules.push(
-        `Target month: ${MONTH_NAMES[month - 1]} ${year}. Hong Kong pays more for the freshest stock.`,
+        "Month matters for fresh pieces (especially Patek, Rolex, AP). Prefer listings closest to our month.",
+      );
+      rules.push(
+        `Target month: ${MONTH_NAMES[ourMonth - 1]} ${year}. Hong Kong pays more for the freshest stock.`,
       );
     } else {
-      rules.push("Year is 2026 — enter the production month so we can match freshness.");
+      rules.push(
+        "Month matters for fresh pieces (especially Patek, Rolex, AP) — add it when known so same-month quotes stand out.",
+      );
     }
-  } else if (year === 2025 || year === 2024) {
-    yearsToCheck = [2024, 2025];
+  } else if (year === currentYear - 1 || year === currentYear - 2) {
+    yearsToCheck = [currentYear - 2, currentYear - 1];
     rules.push(
-      `Our watch is ${year} — report 2024 and 2025 only. Do not use 2026 prices as a reference.`,
+      `Our watch is ${year} — report ${yearsToCheck.join(" and ")} only. Do not use ${currentYear} prices as a reference.`,
     );
   } else {
     yearsToCheck = [year, year - 1].filter((y) => y >= 1990);
@@ -132,7 +176,7 @@ export function buildYearPlan(year: number, month?: number | null): YearPlan {
 
   return {
     ourYear: year,
-    ourMonth: monthMatters ? month ?? null : null,
+    ourMonth,
     yearsToCheck,
     rules,
     monthMatters,
@@ -200,10 +244,13 @@ export function emptyB2CSlice(
   };
 }
 
-export function buildEmptyReport(input: ResearchInput): ResearchReport {
+export function buildEmptyReport(
+  input: ResearchInput,
+  currentYear?: number,
+): ResearchReport {
   const reference = normalizeReference(input.reference);
   const dial = input.dial?.trim() || extractDialHint(reference);
-  const yearPlan = buildYearPlan(input.year, input.month);
+  const yearPlan = buildYearPlan(input.year, input.month, currentYear);
   const byYear: ResearchReport["b2c"]["byYear"] = {};
 
   for (const y of yearPlan.yearsToCheck) {
@@ -219,14 +266,14 @@ export function buildEmptyReport(input: ResearchInput): ResearchReport {
     dial,
     year: input.year,
     month: yearPlan.ourMonth,
+    generatedAt: new Date().toISOString(),
     yearPlan,
     b2b: yearPlan.yearsToCheck.map((y) => ({
-      price: "",
-      currency: "USD",
-      source: "timedealer",
       year: y,
-      month: y === 2026 ? yearPlan.ourMonth : null,
-      notes: "",
+      month: y === input.year ? yearPlan.ourMonth : null,
+      quotes: [],
+      totalFound: 0,
+      status: "skipped",
     })),
     b2c: { byYear },
     links: {
@@ -241,15 +288,61 @@ export function buildEmptyReport(input: ResearchInput): ResearchReport {
     feasibility: {
       b2cAuto: false,
       b2bAuto: false,
-      notes: [
+      b2bNote:
+        "B2B (TimeDealer + dealer groups) requires your team login. HKD stays HKD.",
+      b2cNote:
         "B2C can auto-fill when a ReefAPI key is configured (Chrono24 blocks direct scraping).",
-        "B2B (TimeDealer + dealer groups) requires your team login — enter prices manually; keep HKD as HKD.",
-      ],
     },
   };
 }
 
-function formatMoney(price: number | string, currency: string): string {
+const CURRENCY_ORDER = ["HKD", "USD"];
+
+function currencyRank(currency: string): number {
+  const i = CURRENCY_ORDER.indexOf(currency);
+  return i === -1 ? CURRENCY_ORDER.length : i;
+}
+
+/** HKD first (Hong Kong market), then USD, then others; cheapest first within each. */
+export function sortQuotes(quotes: B2BQuote[]): B2BQuote[] {
+  return [...quotes].sort(
+    (a, b) =>
+      currencyRank(a.currency) - currencyRank(b.currency) ||
+      a.currency.localeCompare(b.currency) ||
+      a.price - b.price,
+  );
+}
+
+export type CurrencyGroup = {
+  currency: string;
+  quotes: B2BQuote[];
+  low: number;
+  high: number;
+};
+
+/** Never mixes currencies — each group keeps its own prices, cheapest first. */
+export function groupQuotesByCurrency(quotes: B2BQuote[]): CurrencyGroup[] {
+  const groups = new Map<string, B2BQuote[]>();
+  for (const quote of sortQuotes(quotes)) {
+    const list = groups.get(quote.currency) ?? [];
+    list.push(quote);
+    groups.set(quote.currency, list);
+  }
+  return [...groups].map(([currency, list]) => ({
+    currency,
+    quotes: list,
+    low: list[0]!.price,
+    high: list[list.length - 1]!.price,
+  }));
+}
+
+/** Month number from a TimeDealer release date like "2026-03" or "2026-03-14". */
+export function releaseMonth(releaseDate: string | null): number | null {
+  const m = releaseDate?.match(/^\d{4}-(\d{1,2})/);
+  return m ? Number(m[1]) : null;
+}
+
+export function formatMoney(price: number | string, currency: string): string {
   if (price === "" || price === null || price === undefined) return "—";
   const n = typeof price === "number" ? price : Number(String(price).replace(/,/g, ""));
   if (!Number.isFinite(n)) return `${price} ${currency}`.trim();
@@ -264,11 +357,21 @@ function formatMoney(price: number | string, currency: string): string {
   }
 }
 
+function describeQuote(quote: B2BQuote): string {
+  return [
+    quote.seller || "dealer",
+    quote.group,
+    quote.releaseDate ? `dated ${quote.releaseDate}` : null,
+    quote.condition,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 export function formatReportText(report: ResearchReport): string {
-  const monthLabel =
-    report.year === 2026 && report.month
-      ? `${report.year} (${MONTH_NAMES[report.month - 1]})`
-      : String(report.year);
+  const monthLabel = report.month
+    ? `${report.year} (${MONTH_NAMES[report.month - 1]})`
+    : String(report.year);
 
   const lines: string[] = [];
   lines.push(`Reference + dial: ${report.reference} · dial ${report.dial}`);
@@ -276,17 +379,29 @@ export function formatReportText(report: ResearchReport): string {
   lines.push("");
   lines.push("B2B:");
   for (const entry of report.b2b) {
-    const ym =
-      entry.year === 2026 && entry.month
-        ? `${entry.year}/${String(entry.month).padStart(2, "0")}`
-        : String(entry.year);
-    const price =
-      entry.price.trim() === ""
-        ? "PENDING"
-        : formatMoney(entry.price, entry.currency);
-    lines.push(
-      `  · ${ym}: ${price} · source ${entry.source || "timedealer / group"}${entry.notes ? ` · ${entry.notes}` : ""}`,
-    );
+    const ym = entry.month
+      ? `${entry.year}/${String(entry.month).padStart(2, "0")}`
+      : String(entry.year);
+    if (!entry.quotes.length) {
+      lines.push(`  · ${ym}: PENDING${entry.note ? ` — ${entry.note}` : ""}`);
+      continue;
+    }
+    const count = entry.totalFound || entry.quotes.length;
+    lines.push(`  · ${ym}: ${count} dealer quote${count === 1 ? "" : "s"}`);
+    for (const group of groupQuotesByCurrency(entry.quotes)) {
+      const range =
+        group.low === group.high
+          ? formatMoney(group.low, group.currency)
+          : `${formatMoney(group.low, group.currency)} – ${formatMoney(group.high, group.currency)}`;
+      lines.push(`      ${group.currency} ×${group.quotes.length}: ${range}`);
+      for (const quote of group.quotes.slice(0, REPORT_QUOTES_PER_CURRENCY)) {
+        lines.push(
+          `        – ${formatMoney(quote.price, quote.currency)} · ${describeQuote(quote)}`,
+        );
+      }
+      const more = group.quotes.length - REPORT_QUOTES_PER_CURRENCY;
+      if (more > 0) lines.push(`        + ${more} more`);
+    }
   }
 
   lines.push("");

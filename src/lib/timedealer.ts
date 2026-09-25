@@ -1,25 +1,25 @@
 import CryptoJS from "crypto-js";
+import { fetchWithTimeout, isAbortError, timeLeft } from "@/lib/http";
+import { sortQuotes, type B2BQuote } from "@/lib/watch-research";
 
 const SECRET = "jgoteam@2024";
 const API_BASE = "https://timedealer.io/api";
 const DEFAULT_DEVICE_ID = "watch-price-research-device";
+/** Reuse one login instead of logging in (with force_login) on every search. */
+const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+/** Quotes kept per year for the price cards. */
+const MAX_QUOTES_PER_YEAR = 60;
 
-export type TimeDealerListing = {
-  itemId: string;
-  reference: string;
-  price: number;
-  currency: string;
-  releaseDate: string | null;
-  groupName: string | null;
-  transactionType: string | null;
-  note: string | null;
-  senderName: string | null;
+export type TimeDealerYearResult = {
+  quotes: B2BQuote[];
+  totalFound: number;
+  error?: string;
+  /** Session looked expired/invalid — caller should re-login and retry. */
+  authFailed?: boolean;
 };
 
-export type TimeDealerSearchResult = {
-  year: number;
-  listings: TimeDealerListing[];
-  lowest: TimeDealerListing | null;
+export type TimeDealerQuotes = {
+  byYear: Record<number, TimeDealerYearResult>;
   error?: string;
 };
 
@@ -52,21 +52,22 @@ function cookieJarFromResponse(res: Response): string {
   return single.split("," ).map((part) => part.trim().split(";")[0]!).join("; ");
 }
 
-export async function loginTimeDealer(opts?: {
+export async function loginTimeDealer(opts: {
+  deadline: number;
   phone?: string;
   password?: string;
   deviceId?: string;
 }): Promise<{ cookie: string; error?: string }> {
   const phone = normalizePhone(
-    opts?.phone ||
+    opts.phone ||
       process.env.TIMEDEALER_PHONE ||
       process.env.TIMEDEALER_USER ||
       "",
   );
   const password =
-    opts?.password || process.env.TIMEDEALER_PASSWORD || "";
+    opts.password || process.env.TIMEDEALER_PASSWORD || "";
   const deviceId =
-    opts?.deviceId || process.env.TIMEDEALER_DEVICE_ID || DEFAULT_DEVICE_ID;
+    opts.deviceId || process.env.TIMEDEALER_DEVICE_ID || DEFAULT_DEVICE_ID;
 
   if (!phone || !password) {
     return {
@@ -74,6 +75,11 @@ export async function loginTimeDealer(opts?: {
       error:
         "TimeDealer credentials missing. Set TIMEDEALER_PHONE and TIMEDEALER_PASSWORD in .env.local.",
     };
+  }
+
+  const budget = Math.min(15_000, timeLeft(opts.deadline) - 500);
+  if (budget < 2_000) {
+    return { cookie: "", error: "TimeDealer login skipped — out of time" };
   }
 
   const payload = {
@@ -90,16 +96,19 @@ export async function loginTimeDealer(opts?: {
   };
 
   try {
-    const res = await fetch(`${API_BASE}/login`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        "user-agent": "WatchPriceResearch/1.0",
+    const res = await fetchWithTimeout(
+      `${API_BASE}/login`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          "user-agent": "WatchPriceResearch/1.0",
+        },
+        body: JSON.stringify(encryptPayload(payload)),
       },
-      body: JSON.stringify(encryptPayload(payload)),
-      cache: "no-store",
-    });
+      budget,
+    );
     const json = (await res.json()) as {
       code?: string;
       message?: string;
@@ -118,61 +127,140 @@ export async function loginTimeDealer(opts?: {
   } catch (e) {
     return {
       cookie: "",
-      error: e instanceof Error ? e.message : "TimeDealer login network error",
+      error: isAbortError(e)
+        ? "TimeDealer login timed out"
+        : e instanceof Error
+          ? e.message
+          : "TimeDealer login network error",
     };
   }
+}
+
+let cachedSession: { cookie: string; expiresAt: number } | null = null;
+let loginInFlight: Promise<{ cookie: string; error?: string }> | null = null;
+
+async function getSession(
+  deadline: number,
+  refresh = false,
+): Promise<{ cookie: string; error?: string }> {
+  if (refresh) cachedSession = null;
+  if (cachedSession && cachedSession.expiresAt > Date.now()) {
+    return { cookie: cachedSession.cookie };
+  }
+  // Concurrent searches share one login.
+  loginInFlight ??= loginTimeDealer({ deadline })
+    .then((result) => {
+      if (result.cookie) {
+        cachedSession = {
+          cookie: result.cookie,
+          expiresAt: Date.now() + SESSION_TTL_MS,
+        };
+      }
+      return result;
+    })
+    .finally(() => {
+      loginInFlight = null;
+    });
+  return loginInFlight;
 }
 
 type RawItem = {
   item_id?: string | number;
   ref?: string;
   price?: number | string | null;
-  currency?: string | null;
-  release_date?: string | null;
-  group_name?: string | null;
-  transaction_type?: string | null;
-  note?: string | null;
-  sender_name?: string | null;
   r_price?: number | string | null;
   amount?: number | string | null;
+  usd_price?: number | string | null;
+  currency?: string | null;
+  release_date?: string | null;
+  posted_time?: string | number | null;
+  group_name?: string | null;
+  note?: string | null;
+  sender_name?: string | null;
+  sender_phone?: string | null;
+  sender_avt?: string | null;
+  condition?: string | null;
+  color?: string | null;
+  image?: string | null;
+  verification?: number | string | null;
+  duplicate_count?: number | string | null;
 };
 
-function toListing(raw: RawItem): TimeDealerListing | null {
-  const priceRaw = raw.price ?? raw.r_price ?? raw.amount;
-  const price = Number(priceRaw);
+function text(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  return s ? s : null;
+}
+
+function httpUrl(value: unknown): string | null {
+  const s = text(value);
+  return s && /^https?:\/\//i.test(s) ? s : null;
+}
+
+function toIsoTime(value: string | number | null | undefined): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  let ms: number;
+  if (typeof value === "number" || /^\d+$/.test(String(value))) {
+    const n = Number(value);
+    ms = n < 1e12 ? n * 1000 : n; // seconds or milliseconds
+  } else {
+    ms = Date.parse(String(value));
+  }
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+function toQuote(raw: RawItem): B2BQuote | null {
+  const price = Number(raw.price ?? raw.r_price ?? raw.amount);
   if (!Number.isFinite(price) || price <= 0) return null;
+  const usdPrice = Number(raw.usd_price);
+  const dup = Number(raw.duplicate_count);
   return {
-    itemId: String(raw.item_id ?? `${raw.ref}-${price}`),
+    id: String(raw.item_id ?? `${raw.ref}-${price}-${raw.sender_phone ?? ""}`),
     reference: String(raw.ref ?? ""),
     price,
     currency: String(raw.currency || "HKD").toUpperCase(),
-    releaseDate: raw.release_date ?? null,
-    groupName: raw.group_name ?? null,
-    transactionType: raw.transaction_type ?? null,
-    note: raw.note ?? null,
-    senderName: raw.sender_name ?? null,
+    usdPrice: Number.isFinite(usdPrice) && usdPrice > 0 ? usdPrice : null,
+    releaseDate: text(raw.release_date),
+    postedAt: toIsoTime(raw.posted_time),
+    seller: text(raw.sender_name),
+    sellerPhone: text(raw.sender_phone),
+    sellerAvatar: httpUrl(raw.sender_avt),
+    group: text(raw.group_name),
+    condition: text(raw.condition),
+    color: text(raw.color),
+    note: text(raw.note),
+    image: httpUrl(raw.image),
+    verified: Number(raw.verification) === 1,
+    timesPosted: raw.duplicate_count != null && Number.isFinite(dup) ? dup + 1 : null,
   };
 }
 
-function matchesYear(releaseDate: string | null, year: number): boolean {
-  if (!releaseDate) return false;
-  return releaseDate.startsWith(String(year));
-}
-
-function monthDistance(releaseDate: string | null, month: number | null): number {
-  if (!month || !releaseDate) return 99;
-  const m = releaseDate.match(/^\d{4}-(\d{1,2})/);
-  if (!m) return 50;
-  return Math.abs(Number(m[1]) - month);
+/** Map raw feed items to quotes for one reference + year, sorted for display. */
+export function parseTimeDealerItems(
+  items: RawItem[],
+  opts: { reference: string; year: number },
+): B2BQuote[] {
+  const ref = opts.reference.toUpperCase();
+  return sortQuotes(
+    items
+      .map(toQuote)
+      .filter((q): q is B2BQuote => Boolean(q))
+      .filter((q) => q.reference.toUpperCase().includes(ref))
+      .filter((q) => Boolean(q.releaseDate?.startsWith(String(opts.year)))),
+  );
 }
 
 export async function searchTimeDealerForSale(opts: {
   cookie: string;
   reference: string;
   year: number;
-  month?: number | null;
-  limit?: number;
-}): Promise<TimeDealerSearchResult> {
+  deadline: number;
+}): Promise<TimeDealerYearResult> {
+  const budget = Math.min(20_000, timeLeft(opts.deadline) - 500);
+  if (budget < 2_000) {
+    return { quotes: [], totalFound: 0, error: "TimeDealer search skipped — out of time" };
+  }
+
   const body = {
     param: {
       time_range: 7776000, // ~90 days of dealer feed
@@ -198,56 +286,93 @@ export async function searchTimeDealerForSale(opts: {
   };
 
   try {
-    const res = await fetch(`${API_BASE}/search-item`, {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-        cookie: opts.cookie,
-        "user-agent": "WatchPriceResearch/1.0",
+    const res = await fetchWithTimeout(
+      `${API_BASE}/search-item`,
+      {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          cookie: opts.cookie,
+          "user-agent": "WatchPriceResearch/1.0",
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-      cache: "no-store",
-    });
-    if (!res.ok) {
+      budget,
+    );
+    if (res.status === 401 || res.status === 403) {
       return {
-        year: opts.year,
-        listings: [],
-        lowest: null,
-        error: `TimeDealer search HTTP ${res.status}`,
+        quotes: [],
+        totalFound: 0,
+        authFailed: true,
+        error: "TimeDealer session expired",
       };
     }
-    const json = (await res.json()) as { items?: RawItem[]; total?: number };
-    const listings = (json.items ?? [])
-      .map(toListing)
-      .filter((x): x is TimeDealerListing => Boolean(x))
-      .filter((x) =>
-        x.reference.toUpperCase().includes(opts.reference.toUpperCase()),
-      )
-      .filter((x) => matchesYear(x.releaseDate, opts.year))
-      .sort((a, b) => {
-        // Prefer HKD dealer quotes (HK market), then closer month, then lower price
-        const currRank = (c: string) => (c === "HKD" ? 0 : c === "USD" ? 1 : 2);
-        const ca = currRank(a.currency);
-        const cb = currRank(b.currency);
-        if (ca !== cb) return ca - cb;
-        const ma = monthDistance(a.releaseDate, opts.month ?? null);
-        const mb = monthDistance(b.releaseDate, opts.month ?? null);
-        if (ma !== mb) return ma - mb;
-        return a.price - b.price;
-      });
-
+    if (!res.ok) {
+      return { quotes: [], totalFound: 0, error: `TimeDealer search HTTP ${res.status}` };
+    }
+    const json = (await res.json()) as { items?: RawItem[]; message?: string };
+    if (!Array.isArray(json.items)) {
+      // A valid search always carries an items array; anything else is
+      // usually an expired session answered with HTTP 200.
+      return {
+        quotes: [],
+        totalFound: 0,
+        authFailed: true,
+        error: json.message ? `TimeDealer: ${json.message}` : "TimeDealer returned no items",
+      };
+    }
+    const quotes = parseTimeDealerItems(json.items, opts);
     return {
-      year: opts.year,
-      listings: listings.slice(0, opts.limit ?? 12),
-      lowest: listings[0] ?? null,
+      quotes: quotes.slice(0, MAX_QUOTES_PER_YEAR),
+      totalFound: quotes.length,
     };
   } catch (e) {
     return {
-      year: opts.year,
-      listings: [],
-      lowest: null,
-      error: e instanceof Error ? e.message : "TimeDealer search failed",
+      quotes: [],
+      totalFound: 0,
+      error: isAbortError(e)
+        ? "TimeDealer search timed out"
+        : e instanceof Error
+          ? e.message
+          : "TimeDealer search failed",
     };
   }
+}
+
+/** Dealer quotes for each comparison year, re-logging in once if the session expired. */
+export async function fetchTimeDealerQuotes(opts: {
+  reference: string;
+  years: number[];
+  deadline: number;
+}): Promise<TimeDealerQuotes> {
+  async function searchAll(cookie: string) {
+    const results = await Promise.all(
+      opts.years.map((year) =>
+        searchTimeDealerForSale({
+          cookie,
+          reference: opts.reference,
+          year,
+          deadline: opts.deadline,
+        }),
+      ),
+    );
+    return Object.fromEntries(opts.years.map((y, i) => [y, results[i]!]));
+  }
+
+  let session = await getSession(opts.deadline);
+  if (!session.cookie) {
+    return { byYear: {}, error: session.error || "TimeDealer login failed" };
+  }
+  let byYear = await searchAll(session.cookie);
+
+  if (Object.values(byYear).some((r) => r.authFailed)) {
+    session = await getSession(opts.deadline, true);
+    if (!session.cookie) {
+      return { byYear: {}, error: session.error || "TimeDealer login failed" };
+    }
+    byYear = await searchAll(session.cookie);
+  }
+
+  return { byYear };
 }

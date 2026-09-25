@@ -1,4 +1,8 @@
+import { fetchWithTimeout, isAbortError, timeLeft } from "@/lib/http";
 import type { MarketListing } from "@/lib/watch-research";
+
+const OUT_OF_TIME =
+  "Stopped at the time limit — some Chrono24 prices may be missing. Use the Open Chrono24 year links.";
 
 type ReefSearchResponse = {
   ok?: boolean;
@@ -84,31 +88,22 @@ async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  timeoutMs: number,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal, cache: "no-store" });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function reefSearch(opts: {
   apiKey: string;
   query: string;
   sort: "price_asc" | "price_desc" | "relevance";
-  page?: number;
+  deadline: number;
   attempts?: number;
 }): Promise<Chrono24FetchResult> {
   const attempts = opts.attempts ?? 3;
   let lastError = "Chrono24 search failed";
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    const budget = Math.min(25_000, timeLeft(opts.deadline) - 500);
+    if (budget < 3_000) {
+      lastError = OUT_OF_TIME;
+      break;
+    }
     try {
       const res = await fetchWithTimeout(
         "https://api.reefapi.com/chrono24/v1/search",
@@ -122,10 +117,10 @@ async function reefSearch(opts: {
           body: JSON.stringify({
             query: opts.query,
             sort: opts.sort,
-            page: opts.page ?? 1,
+            page: 1,
           }),
         },
-        25_000,
+        budget,
       );
 
       if (!res.ok) {
@@ -170,7 +165,7 @@ async function reefSearch(opts: {
       return { listings, currency, source: "reefapi" };
     } catch (e) {
       lastError =
-        e instanceof Error && e.name === "AbortError"
+        isAbortError(e)
           ? "Chrono24 search timed out. Retry or use the Open Chrono24 links."
           : e instanceof Error
             ? e.message
@@ -190,7 +185,10 @@ async function reefSearch(opts: {
 async function reefDetail(
   apiKey: string,
   listingId: string,
+  deadline: number,
 ): Promise<MarketListing | null> {
+  const budget = Math.min(12_000, timeLeft(deadline) - 300);
+  if (budget < 1_500) return null;
   try {
     const res = await fetchWithTimeout(
       "https://api.reefapi.com/chrono24/v1/detail",
@@ -203,7 +201,7 @@ async function reefDetail(
         },
         body: JSON.stringify({ listing_id: listingId }),
       },
-      12_000,
+      budget,
     );
     if (!res.ok) return null;
     const json = (await res.json()) as ReefDetailResponse;
@@ -265,8 +263,11 @@ export async function fetchChrono24VerifiedByYears(opts: {
   apiKey: string;
   query: string;
   years: number[];
+  /** Epoch ms by which we must return, with whatever was verified so far. */
+  deadline: number;
   detailLimit?: number;
 }): Promise<VerifiedChrono24Market> {
+  const { deadline } = opts;
   const years = [...new Set(opts.years)].sort();
   const byYear: VerifiedChrono24Market["byYear"] = {};
   for (const y of years) {
@@ -291,12 +292,14 @@ export async function fetchChrono24VerifiedByYears(opts: {
           apiKey: opts.apiKey,
           query: yearQuery,
           sort: "price_asc",
+          deadline,
           attempts: 2,
         }),
         reefSearch({
           apiKey: opts.apiKey,
           query: yearQuery,
           sort: "price_desc",
+          deadline,
           attempts: 2,
         }),
       ]);
@@ -308,12 +311,17 @@ export async function fetchChrono24VerifiedByYears(opts: {
 
       const detailCache = new Map<string, MarketListing | null>();
       let calls = 0;
+      let outOfTime = false;
+      const canFetchMore = () => {
+        if (timeLeft(deadline) < 1_500) outOfTime = true;
+        return calls < maxDetailsPerYear && !outOfTime;
+      };
 
       async function detailCached(id: string): Promise<MarketListing | null> {
         if (detailCache.has(id)) return detailCache.get(id)!;
-        if (calls >= maxDetailsPerYear) return null;
+        if (!canFetchMore()) return null;
         calls += 1;
-        const d = await reefDetail(opts.apiKey, id);
+        const d = await reefDetail(opts.apiKey, id, deadline);
         detailCache.set(id, d);
         return d;
       }
@@ -323,7 +331,7 @@ export async function fetchChrono24VerifiedByYears(opts: {
         pred: (d: MarketListing) => boolean,
       ): Promise<MarketListing | null> {
         const batchSize = 3;
-        for (let i = 0; i < listings.length && calls < maxDetailsPerYear; i += batchSize) {
+        for (let i = 0; i < listings.length && canFetchMore(); i += batchSize) {
           const batch = listings.slice(i, i + batchSize);
           const details = await Promise.all(batch.map((l) => detailCached(l.id)));
           for (const d of details) {
@@ -331,7 +339,7 @@ export async function fetchChrono24VerifiedByYears(opts: {
           }
         }
         // Approximation fallback
-        for (let i = 0; i < listings.length && calls < maxDetailsPerYear; i += batchSize) {
+        for (let i = 0; i < listings.length && canFetchMore(); i += batchSize) {
           const batch = listings.slice(i, i + batchSize);
           const details = await Promise.all(batch.map((l) => detailCached(l.id)));
           for (const d of details) {
@@ -356,37 +364,14 @@ export async function fetchChrono24VerifiedByYears(opts: {
         highestWorld,
         lowestUae,
         verifiedCount: verified.length,
-        note: !lowestWorld && !highestWorld
-          ? `No Chrono24 listings verified for year ${y}. Use the year-filtered Chrono24 link.`
-          : `Year ${y} search verified via Chrono24 details. Listing price before shipping.`,
+        note: outOfTime
+          ? OUT_OF_TIME
+          : !lowestWorld && !highestWorld
+            ? `No Chrono24 listings verified for year ${y}. Use the year-filtered Chrono24 link.`
+            : `Year ${y} search verified via Chrono24 details. Listing price before shipping.`,
       };
     }),
   );
 
   return { byYear };
-}
-
-/** @deprecated Prefer fetchChrono24VerifiedByYears — search year filter is ignored by ReefAPI. */
-export async function searchChrono24ViaReef(opts: {
-  apiKey: string;
-  query: string;
-  year: number;
-  sort: "price_asc" | "price_desc" | "relevance";
-  page?: number;
-}): Promise<Chrono24FetchResult> {
-  return reefSearch({
-    apiKey: opts.apiKey,
-    query: opts.query,
-    sort: opts.sort,
-    page: opts.page,
-  });
-}
-
-export function pickExtreme(
-  listings: MarketListing[],
-  which: "lowest" | "highest",
-): MarketListing | null {
-  if (!listings.length) return null;
-  const sorted = [...listings].sort((a, b) => a.price - b.price);
-  return which === "lowest" ? sorted[0]! : sorted[sorted.length - 1]!;
 }

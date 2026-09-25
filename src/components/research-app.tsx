@@ -3,10 +3,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  BadgeCheck,
   Check,
   Copy,
   ExternalLink,
   Loader2,
+  MessageCircle,
   Search,
   Settings2,
   Watch,
@@ -23,13 +25,18 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { useLocalStorage } from "@/lib/use-local-storage";
 import {
   MONTH_NAMES,
+  formatMoney,
   formatReportText,
-  type B2BEntry,
+  groupQuotesByCurrency,
+  releaseMonth,
+  type B2BQuote,
+  type B2BYear,
+  type CurrencyGroup,
   type MarketListing,
   type ResearchReport,
 } from "@/lib/watch-research";
@@ -37,18 +44,304 @@ import { cn } from "@/lib/utils";
 
 const STORAGE_KEY = "watch-price-research:reef-key";
 const HISTORY_KEY = "watch-price-research:history";
+/** Quote cards shown per currency before "Show all". */
+const INITIAL_QUOTE_CARDS = 6;
+
+export type DeepLink = {
+  reference: string;
+  year: string;
+  month: string;
+  dial: string;
+  tab: "b2b" | "b2c" | "report";
+  autorun: boolean;
+  skipB2B: boolean;
+};
+
+type HistoryEntry = {
+  reference: string;
+  year: number;
+  month?: number | null;
+  at: string;
+};
+
+function parseHistory(raw: string | null): HistoryEntry[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as HistoryEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
 
 function money(listing: MarketListing | null | undefined): string {
-  if (!listing) return "—";
-  try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: listing.currency || "USD",
-      maximumFractionDigits: 0,
-    }).format(listing.price);
-  } catch {
-    return `${listing.price.toLocaleString()} ${listing.currency}`;
-  }
+  return listing ? formatMoney(listing.price, listing.currency) : "—";
+}
+
+function noteTone(note: string): string {
+  return /timed out|unavailable|error|failed|HTTP|missing|Stopped/i.test(note)
+    ? "border-red-200/80 bg-red-50/70 text-ink"
+    : "border-teal-200/80 bg-teal-50/60 text-ink";
+}
+
+function sentence(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+const relativeTime = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+
+/** Relative to when the report was generated, so renders stay pure. */
+function timeAgo(iso: string | null, nowIso: string): string | null {
+  if (!iso) return null;
+  const diffMs = Date.parse(iso) - Date.parse(nowIso);
+  if (!Number.isFinite(diffMs)) return null;
+  const minutes = Math.round(diffMs / 60_000);
+  if (Math.abs(minutes) < 60) return relativeTime.format(minutes, "minute");
+  const hours = Math.round(minutes / 60);
+  if (Math.abs(hours) < 24) return relativeTime.format(hours, "hour");
+  return relativeTime.format(Math.round(hours / 24), "day");
+}
+
+function whatsappUrl(phone: string | null): string | null {
+  const digits = phone?.replace(/\D/g, "") ?? "";
+  return digits.length >= 8 ? `https://wa.me/${digits}` : null;
+}
+
+function QuoteCard({
+  quote,
+  lowest,
+  targetMonth,
+  generatedAt,
+}: {
+  quote: B2BQuote;
+  lowest: boolean;
+  targetMonth: number | null;
+  generatedAt: string;
+}) {
+  const sameMonth =
+    targetMonth !== null && releaseMonth(quote.releaseDate) === targetMonth;
+  const posted = timeAgo(quote.postedAt, generatedAt);
+  const whatsapp = whatsappUrl(quote.sellerPhone);
+  const details: [string, string | null][] = [
+    ["Dated", quote.releaseDate],
+    ["Condition", quote.condition],
+    ["Dial", quote.color],
+    ["Group", quote.group],
+    [
+      "Posted",
+      [
+        posted,
+        quote.timesPosted && quote.timesPosted > 1
+          ? `${quote.timesPosted}× posted`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" · ") || null,
+    ],
+  ];
+
+  return (
+    <article
+      className={cn(
+        "flex flex-col gap-3 rounded-xl border bg-white/85 p-4",
+        lowest ? "border-teal-700/35 ring-1 ring-teal-700/15" : "border-ink/10",
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-2xl font-semibold tabular-nums tracking-tight text-ink">
+            {formatMoney(quote.price, quote.currency)}
+          </p>
+          {quote.usdPrice && quote.currency !== "USD" ? (
+            <p className="text-xs tabular-nums text-ink/55">
+              ≈ {formatMoney(quote.usdPrice, "USD")} at TimeDealer rate
+            </p>
+          ) : null}
+        </div>
+        {quote.image ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={quote.image}
+            alt=""
+            loading="lazy"
+            className="size-14 shrink-0 rounded-lg border border-ink/10 object-cover"
+          />
+        ) : null}
+      </div>
+
+      {lowest || quote.verified || sameMonth ? (
+        <div className="flex flex-wrap gap-1.5">
+          {lowest ? (
+            <Badge className="bg-teal-800 text-white">
+              Lowest {quote.currency}
+            </Badge>
+          ) : null}
+          {quote.verified ? (
+            <Badge variant="outline" className="border-teal-700/30 text-teal-900">
+              <BadgeCheck /> Verified
+            </Badge>
+          ) : null}
+          {sameMonth ? (
+            <Badge variant="outline" className="border-amber-600/40 text-amber-900">
+              Same month
+            </Badge>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="flex items-center gap-2.5">
+        {quote.sellerAvatar ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={quote.sellerAvatar}
+            alt=""
+            loading="lazy"
+            className="size-8 shrink-0 rounded-full object-cover"
+          />
+        ) : (
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-ink/8 text-sm font-medium text-ink/70">
+            {(quote.seller || "?").charAt(0).toUpperCase()}
+          </span>
+        )}
+        <div className="min-w-0">
+          <p className="truncate text-sm font-medium text-ink">
+            {quote.seller || "Unknown dealer"}
+          </p>
+          {quote.sellerPhone ? (
+            <p className="truncate text-xs tabular-nums text-ink/55">
+              {quote.sellerPhone}
+            </p>
+          ) : null}
+        </div>
+      </div>
+
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+        {details
+          .filter(([, value]) => value)
+          .map(([label, value]) => (
+            <div key={label} className="contents">
+              <dt className="text-ink/50">{label}</dt>
+              <dd className="min-w-0 truncate text-ink/80">{value}</dd>
+            </div>
+          ))}
+      </dl>
+
+      {quote.note ? (
+        <p
+          className="line-clamp-3 whitespace-pre-line rounded-lg bg-ink/[0.03] px-3 py-2 text-xs leading-relaxed text-ink/70"
+          title={quote.note}
+        >
+          {quote.note}
+        </p>
+      ) : null}
+
+      {whatsapp ? (
+        <a
+          href={whatsapp}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-auto inline-flex h-8 w-fit items-center gap-1.5 rounded-lg border border-ink/15 bg-background px-2.5 text-xs font-medium hover:bg-muted"
+        >
+          <MessageCircle className="size-3.5" /> WhatsApp seller
+        </a>
+      ) : null}
+    </article>
+  );
+}
+
+function CurrencyGroupSection({
+  group,
+  targetMonth,
+  generatedAt,
+}: {
+  group: CurrencyGroup;
+  targetMonth: number | null;
+  generatedAt: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const visible = expanded
+    ? group.quotes
+    : group.quotes.slice(0, INITIAL_QUOTE_CARDS);
+  const count = group.quotes.length;
+
+  return (
+    <section className="space-y-3">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <p className="text-sm font-semibold text-ink">
+          {group.currency} · {count} quote{count === 1 ? "" : "s"}
+        </p>
+        <p className="text-sm tabular-nums text-ink/70">
+          {group.low === group.high
+            ? formatMoney(group.low, group.currency)
+            : `${formatMoney(group.low, group.currency)} – ${formatMoney(group.high, group.currency)}`}
+        </p>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {visible.map((quote, i) => (
+          <QuoteCard
+            key={`${quote.id}-${i}`}
+            quote={quote}
+            lowest={i === 0}
+            targetMonth={targetMonth}
+            generatedAt={generatedAt}
+          />
+        ))}
+      </div>
+      {count > INITIAL_QUOTE_CARDS ? (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded ? "Show fewer" : `Show all ${count} ${group.currency} quotes`}
+        </Button>
+      ) : null}
+    </section>
+  );
+}
+
+function B2BYearCard({
+  entry,
+  generatedAt,
+}: {
+  entry: B2BYear;
+  generatedAt: string;
+}) {
+  const groups = groupQuotesByCurrency(entry.quotes);
+  const count = entry.totalFound || entry.quotes.length;
+
+  return (
+    <Card className="border-ink/10 bg-white/75 shadow-none">
+      <CardHeader>
+        <CardTitle className="text-base">
+          Dealer quotes · {entry.year}
+          {entry.month ? ` · ${MONTH_NAMES[entry.month - 1]}` : ""}
+        </CardTitle>
+        <CardDescription>
+          {groups.length
+            ? `${count} forsale quote${count === 1 ? "" : "s"} on TimeDealer, cheapest first in each currency.${
+                count > entry.quotes.length
+                  ? ` Showing the first ${entry.quotes.length}.`
+                  : ""
+              }`
+            : sentence(entry.note || "No dealer quotes yet.")}
+        </CardDescription>
+      </CardHeader>
+      {groups.length ? (
+        <CardContent className="space-y-6">
+          {groups.map((group) => (
+            <CurrencyGroupSection
+              key={group.currency}
+              group={group}
+              targetMonth={entry.month}
+              generatedAt={generatedAt}
+            />
+          ))}
+        </CardContent>
+      ) : null}
+    </Card>
+  );
 }
 
 function ListingCell({
@@ -162,78 +455,38 @@ function ListingCellInner({
   );
 }
 
-export function ResearchApp() {
-  const [reference, setReference] = useState("");
-  const [year, setYear] = useState(String(new Date().getFullYear()));
-  const [month, setMonth] = useState<string>("");
-  const [dial, setDial] = useState("");
-  const [reefKey, setReefKey] = useState(() => {
-    if (typeof window === "undefined") return "";
-    try {
-      return localStorage.getItem(STORAGE_KEY) || "";
-    } catch {
-      return "";
-    }
-  });
+export function ResearchApp({ initial }: { initial: DeepLink }) {
+  const [reference, setReference] = useState(initial.reference);
+  const [year, setYear] = useState(initial.year);
+  const [month, setMonth] = useState(initial.month);
+  const [dial, setDial] = useState(initial.dial);
+  const [storedReefKey, setStoredReefKey] = useLocalStorage(STORAGE_KEY);
+  const reefKey = storedReefKey ?? "";
   const [showSettings, setShowSettings] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<ResearchReport | null>(null);
   const [copied, setCopied] = useState(false);
-  const [history, setHistory] = useState<
-    { reference: string; year: number; at: string }[]
-  >(() => {
-    if (typeof window === "undefined") return [];
-    try {
-      const raw = localStorage.getItem(HISTORY_KEY);
-      return raw
-        ? (JSON.parse(raw) as { reference: string; year: number; at: string }[])
-        : [];
-    } catch {
-      return [];
-    }
-  });
+  const [historyRaw, setHistoryRaw] = useLocalStorage(HISTORY_KEY);
+  const history = useMemo(() => parseHistory(historyRaw), [historyRaw]);
   const [pending, setPending] = useState(false);
-  const [tab, setTab] = useState("b2c");
+  const [tab, setTab] = useState<string>(initial.tab);
   const autoRan = useRef(false);
 
   const yearNum = Number(year);
-  const needsMonth = yearNum === 2026;
 
   const reportText = useMemo(
     () => (report ? formatReportText(report) : ""),
     [report],
   );
 
-  function persistKey(value: string) {
-    setReefKey(value);
-    try {
-      localStorage.setItem(STORAGE_KEY, value);
-    } catch {
-      /* ignore */
-    }
-  }
-
-  function pushHistory(ref: string, y: number) {
-    const next = [
-      { reference: ref, year: y, at: new Date().toISOString() },
-      ...history.filter((h) => !(h.reference === ref && h.year === y)),
+  function pushHistory(ref: string, y: number, m: number | null) {
+    const next: HistoryEntry[] = [
+      { reference: ref, year: y, month: m, at: new Date().toISOString() },
+      ...history.filter(
+        (h) => !(h.reference === ref && h.year === y && (h.month ?? null) === m),
+      ),
     ].slice(0, 12);
-    setHistory(next);
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
-    } catch {
-      /* ignore */
-    }
-  }
-
-  function updateB2b(index: number, patch: Partial<B2BEntry>) {
-    setReport((prev) => {
-      if (!prev) return prev;
-      const b2b = prev.b2b.map((row, i) =>
-        i === index ? { ...row, ...patch } : row,
-      );
-      return { ...prev, b2b };
-    });
+    setHistoryRaw(JSON.stringify(next));
   }
 
   function updateB2c(
@@ -260,32 +513,18 @@ export function ResearchApp() {
     });
   }
 
-  async function runResearch(opts?: {
-    reference?: string;
-    year?: number;
-    month?: string;
-    dial?: string;
-    skipB2B?: boolean;
-  }) {
-    const ref = (opts?.reference ?? reference).trim();
-    const y = opts?.year ?? yearNum;
-    const m = opts?.month ?? month;
-    const dialValue = opts?.dial ?? dial;
-    const monthRequired = y === 2026;
+  async function runResearch(opts?: { skipB2B?: boolean }) {
+    const ref = reference.trim();
 
     if (!ref) {
       setError("Reference is required.");
-      return;
-    }
-    if (monthRequired && !m) {
-      setError("Month is required for 2026 watches.");
       return;
     }
     setError(null);
     setCopied(false);
     setPending(true);
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 70_000);
+    const timer = window.setTimeout(() => controller.abort(), 65_000);
     try {
       const res = await fetch("/api/research", {
         method: "POST",
@@ -293,28 +532,31 @@ export function ResearchApp() {
         signal: controller.signal,
         body: JSON.stringify({
           reference: ref,
-          year: y,
-          month: m ? Number(m) : null,
-          dial: dialValue || undefined,
+          year: yearNum,
+          month: month ? Number(month) : null,
+          dial: dial || undefined,
           reefApiKey: reefKey || undefined,
           autoFetchB2C: true,
           autoFetchB2B: opts?.skipB2B ? false : undefined,
         }),
       });
-      const data = (await res.json()) as {
+      // A gateway timeout can answer with an HTML page, not JSON.
+      const data = (await res.json().catch(() => null)) as {
         report?: ResearchReport;
         error?: string;
-      };
-      if (!res.ok || !data.report) {
-        setError(data.error || "Research failed");
+      } | null;
+      if (!res.ok || !data?.report) {
+        setError(
+          data?.error || `Research failed (HTTP ${res.status}). Retry in a moment.`,
+        );
         return;
       }
       setReport(data.report);
-      pushHistory(data.report.reference, data.report.year);
+      pushHistory(data.report.reference, data.report.year, data.report.month);
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
         setError(
-          "Research timed out after 70s. Retry, or use Open Chrono24 links for B2C.",
+          "Research timed out after 65s. Retry, or use Open Chrono24 links for B2C.",
         );
       } else {
         setError(e instanceof Error ? e.message : "Network error");
@@ -326,35 +568,10 @@ export function ResearchApp() {
   }
 
   useEffect(() => {
-    if (autoRan.current || typeof window === "undefined") return;
-    const params = new URLSearchParams(window.location.search);
-    const ref = params.get("ref") || params.get("reference");
-    const y = params.get("year");
-    const m = params.get("month");
-    const d = params.get("dial");
-    const tabParam = params.get("tab");
-    const autorun = params.get("autorun") === "1";
-    if (!ref && !y && !m && !autorun && !tabParam) return;
-
-    if (ref) setReference(ref);
-    if (y) setYear(y);
-    if (m) setMonth(m);
-    if (d) setDial(d);
-    if (tabParam === "b2b" || tabParam === "b2c" || tabParam === "report") {
-      setTab(tabParam);
-    }
-
-    if (autorun && ref && y) {
-      autoRan.current = true;
-      void runResearch({
-        reference: ref,
-        year: Number(y),
-        month: m || "",
-        dial: d || "",
-        skipB2B: params.get("b2b") === "0",
-      });
-    }
-    // Deep-link autorun once on mount
+    // Deep-link autorun once on mount; the form already holds the link values.
+    if (autoRan.current || !initial.autorun) return;
+    autoRan.current = true;
+    void runResearch({ skipB2B: initial.skipB2B });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -430,7 +647,7 @@ export function ResearchApp() {
                   type="password"
                   placeholder="Stored only in this browser"
                   value={reefKey}
-                  onChange={(e) => persistKey(e.target.value)}
+                  onChange={(e) => setStoredReefKey(e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
                   Free tier at reefapi.com · or set{" "}
@@ -485,9 +702,7 @@ export function ResearchApp() {
                 />
               </div>
               <div className="space-y-2 lg:col-span-2">
-                <Label htmlFor="month">
-                  Month {needsMonth ? "(required for 2026)" : "(optional)"}
-                </Label>
+                <Label htmlFor="month">Month (optional)</Label>
                 <select
                   id="month"
                   value={month}
@@ -515,12 +730,7 @@ export function ResearchApp() {
               <div className="flex flex-col gap-2 lg:col-span-12 sm:flex-row sm:items-center">
                 <Button
                   type="submit"
-                  disabled={
-                    pending ||
-                    !reference.trim() ||
-                    !yearNum ||
-                    (needsMonth && !month)
-                  }
+                  disabled={pending || !reference.trim() || !yearNum}
                   className="h-11 bg-ink text-white hover:bg-ink/90"
                 >
                   {pending ? (
@@ -532,7 +742,7 @@ export function ResearchApp() {
                 </Button>
                 {pending ? (
                   <p className="text-xs text-ink/60">
-                    Checking TimeDealer + Chrono24 — usually under 45s. Stops at 70s.
+                    Checking TimeDealer + Chrono24 — usually under 45s.
                   </p>
                 ) : null}
               </div>
@@ -547,10 +757,12 @@ export function ResearchApp() {
                     onClick={() => {
                       setReference(h.reference);
                       setYear(String(h.year));
+                      setMonth(h.month ? String(h.month) : "");
                     }}
                     className="rounded-full border border-ink/10 bg-white/60 px-3 py-1 text-xs text-ink/70 transition hover:border-teal-700/30 hover:text-ink"
                   >
                     {h.reference} · {h.year}
+                    {h.month ? ` ${MONTH_NAMES[h.month - 1]?.slice(0, 3)}` : ""}
                   </button>
                 ))}
               </div>
@@ -575,7 +787,7 @@ export function ResearchApp() {
                 </p>
                 <p className="text-sm text-ink/65">
                   Dial {report.dial} ·{" "}
-                  {report.year === 2026 && report.month
+                  {report.month
                     ? `${MONTH_NAMES[report.month - 1]} ${report.year}`
                     : report.year}
                 </p>
@@ -602,7 +814,7 @@ export function ResearchApp() {
                       : "border-ink/15 text-ink/70",
                   )}
                 >
-                  B2B {report.feasibility.b2bAuto ? "auto" : "manual"}
+                  B2B {report.feasibility.b2bAuto ? "auto" : "off"}
                 </Badge>
               </div>
             </div>
@@ -626,106 +838,36 @@ export function ResearchApp() {
               </TabsList>
 
               <TabsContent value="b2b" className="space-y-4">
-                <Card className="border-ink/10 bg-white/75 shadow-none">
-                  <CardHeader>
-                    <CardTitle className="text-base">Dealer market</CardTitle>
-                    <CardDescription>
-                      {report.feasibility.b2bAuto
-                        ? "Auto-filled from TimeDealer forsale quotes for each comparison year. Edit if a group quote looks better. HKD stays HKD."
-                        : "Log into TimeDealer, then enter dealer quotes below. If a quote is in HKD, keep it in HKD — do not convert."}
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent className="space-y-4">
-                    <a
-                      href={report.links.timedealer}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex h-9 items-center gap-2 rounded-lg border border-ink/15 bg-background px-3 text-sm font-medium hover:bg-muted"
-                    >
-                      Open TimeDealer <ExternalLink className="size-4" />
-                    </a>
-                    <Separator />
-                    <div className="space-y-4">
-                      {report.b2b.map((row, index) => (
-                        <div
-                          key={`${row.year}-${index}`}
-                          className="grid gap-3 rounded-xl border border-ink/8 p-4 sm:grid-cols-2 lg:grid-cols-6"
-                        >
-                          <div className="lg:col-span-1">
-                            <p className="text-xs uppercase tracking-wide text-muted-foreground">
-                              Year
-                            </p>
-                            <p className="font-medium">
-                              {row.year}
-                              {row.year === 2026 && row.month
-                                ? ` / ${String(row.month).padStart(2, "0")}`
-                                : ""}
-                            </p>
-                          </div>
-                          <div className="space-y-1 lg:col-span-1">
-                            <Label>Price</Label>
-                            <Input
-                              value={row.price}
-                              onChange={(e) =>
-                                updateB2b(index, { price: e.target.value })
-                              }
-                              placeholder="e.g. 185000"
-                            />
-                          </div>
-                          <div className="space-y-1 lg:col-span-1">
-                            <Label>Currency</Label>
-                            <Input
-                              value={row.currency}
-                              onChange={(e) =>
-                                updateB2b(index, {
-                                  currency: e.target.value.toUpperCase(),
-                                })
-                              }
-                              placeholder="USD / HKD / AED"
-                            />
-                          </div>
-                          <div className="space-y-1 lg:col-span-1">
-                            <Label>Source</Label>
-                            <Input
-                              value={row.source}
-                              onChange={(e) =>
-                                updateB2b(index, { source: e.target.value })
-                              }
-                              placeholder="timedealer / group"
-                            />
-                          </div>
-                          <div className="space-y-1 sm:col-span-2 lg:col-span-2">
-                            <Label>Notes</Label>
-                            <Input
-                              value={row.notes || ""}
-                              onChange={(e) =>
-                                updateB2b(index, { notes: e.target.value })
-                              }
-                              placeholder="Freshness, papers, group name…"
-                            />
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </CardContent>
-                </Card>
+                <Alert className={noteTone(report.feasibility.b2bNote)}>
+                  <AlertDescription className="break-words text-sm leading-relaxed">
+                    {report.feasibility.b2bNote}
+                  </AlertDescription>
+                </Alert>
+                <a
+                  href={report.links.timedealer}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-ink/15 bg-white/70 px-3 text-sm font-medium hover:bg-muted"
+                >
+                  Open TimeDealer <ExternalLink className="size-4" />
+                </a>
+                {report.b2b.map((entry) => (
+                  <B2BYearCard
+                    key={entry.year}
+                    entry={entry}
+                    generatedAt={report.generatedAt}
+                  />
+                ))}
               </TabsContent>
 
               <TabsContent value="b2c" className="space-y-4">
-                {report.feasibility.notes.map((n) => (
-                  <Alert
-                    key={n.slice(0, 80)}
-                    className={
-                      /timed out|unavailable|error|failed|HTTP/i.test(n)
-                        ? "border-red-200/80 bg-red-50/70 text-ink"
-                        : "border-teal-200/80 bg-teal-50/60 text-ink"
-                    }
-                  >
-                    <AlertDescription className="break-words text-sm leading-relaxed">
-                      {n.length > 280 ? `${n.slice(0, 280)}…` : n}
-                    </AlertDescription>
-                  </Alert>
-                ))}
+                <Alert className={noteTone(report.feasibility.b2cNote)}>
+                  <AlertDescription className="break-words text-sm leading-relaxed">
+                    {report.feasibility.b2cNote.length > 280
+                      ? `${report.feasibility.b2cNote.slice(0, 280)}…`
+                      : report.feasibility.b2cNote}
+                  </AlertDescription>
+                </Alert>
 
                 {report.yearPlan.yearsToCheck.map((y) => {
                   const bucket = report.b2c.byYear[y];
@@ -801,7 +943,7 @@ export function ResearchApp() {
                         Send-ready result
                       </CardTitle>
                       <CardDescription>
-                        Matches your team template: reference, year, B2B, B2C.
+                        Matches your team template: reference, year, B2B quotes, B2C.
                       </CardDescription>
                     </div>
                     <Button

@@ -1,9 +1,6 @@
 import { NextResponse } from "next/server";
 import { fetchChrono24VerifiedByYears } from "@/lib/chrono24";
-import {
-  loginTimeDealer,
-  searchTimeDealerForSale,
-} from "@/lib/timedealer";
+import { fetchTimeDealerQuotes } from "@/lib/timedealer";
 import {
   buildEmptyReport,
   type ResearchInput,
@@ -13,70 +10,67 @@ import {
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+/** Providers must finish inside this, leaving headroom under maxDuration. */
+const PROVIDER_BUDGET_MS = 50_000;
+
 type Body = ResearchInput & {
   reefApiKey?: string;
   autoFetchB2C?: boolean;
   autoFetchB2B?: boolean;
 };
 
-async function fillB2B(report: ResearchReport): Promise<void> {
-  const login = await loginTimeDealer();
-  if (login.error || !login.cookie) {
-    report.feasibility.b2bAuto = false;
-    report.feasibility.notes[0] =
-      `B2B: ${login.error || "TimeDealer login failed"}`;
+async function fillB2B(report: ResearchReport, deadline: number): Promise<void> {
+  const result = await fetchTimeDealerQuotes({
+    reference: report.reference,
+    years: report.b2b.map((entry) => entry.year),
+    deadline,
+  });
+
+  if (result.error) {
+    report.feasibility.b2bNote = `B2B: ${result.error}`;
+    report.b2b = report.b2b.map((entry) => ({
+      ...entry,
+      status: "error",
+      note: "TimeDealer login failed",
+    }));
     return;
   }
 
-  await Promise.all(
-    report.b2b.map(async (entry, index) => {
-      const result = await searchTimeDealerForSale({
-        cookie: login.cookie,
-        reference: report.reference,
-        year: entry.year,
-        month: entry.month,
-      });
-      if (result.error) {
-        report.b2b[index] = { ...entry, notes: result.error };
-        return;
-      }
-      const hit = result.lowest;
-      if (!hit) {
-        report.b2b[index] = {
-          ...entry,
-          notes: `No forsale hits for ${entry.year} on TimeDealer`,
-        };
-        return;
-      }
-      report.b2b[index] = {
+  report.b2b = report.b2b.map((entry) => {
+    const found = result.byYear[entry.year];
+    if (!found) return entry;
+    if (found.error) return { ...entry, status: "error", note: found.error };
+    if (!found.quotes.length) {
+      return {
         ...entry,
-        price: String(hit.price),
-        currency: hit.currency,
-        source: hit.groupName ? `timedealer / ${hit.groupName}` : "timedealer",
-        notes: [
-          hit.releaseDate ? `release ${hit.releaseDate}` : null,
-          hit.senderName ? `dealer ${hit.senderName}` : null,
-          result.listings.length > 1
-            ? `${result.listings.length} forsale comps`
-            : null,
-        ]
-          .filter(Boolean)
-          .join(" · "),
+        status: "empty",
+        note: `no forsale quotes for ${entry.year} on TimeDealer (last 90 days)`,
       };
-    }),
-  );
+    }
+    return {
+      ...entry,
+      status: "ok",
+      quotes: found.quotes,
+      totalFound: found.totalFound,
+    };
+  });
 }
 
-async function fillB2C(report: ResearchReport, apiKey: string): Promise<void> {
+async function fillB2C(
+  report: ResearchReport,
+  apiKey: string,
+  deadline: number,
+): Promise<void> {
   const verified = await fetchChrono24VerifiedByYears({
     apiKey,
     query: report.reference,
     years: report.yearPlan.yearsToCheck,
+    deadline,
     detailLimit: 28,
   });
 
   if (verified.error) {
-    report.feasibility.notes[1] = `B2C: ${verified.error}`;
+    report.feasibility.b2cNote = `B2C: ${verified.error}`;
   }
 
   for (const y of report.yearPlan.yearsToCheck) {
@@ -110,6 +104,8 @@ async function fillB2C(report: ResearchReport, apiKey: string): Promise<void> {
 }
 
 export async function POST(req: Request) {
+  const deadline = Date.now() + PROVIDER_BUDGET_MS;
+
   let body: Body;
   try {
     body = (await req.json()) as Body;
@@ -136,14 +132,7 @@ export async function POST(req: Request) {
       ? null
       : Number(body.month);
 
-  if (year === 2026 && month === null) {
-    return NextResponse.json(
-      { error: "Month is required for 2026 watches" },
-      { status: 400 },
-    );
-  }
-
-  if (month !== null && (!Number.isFinite(month) || month < 1 || month > 12)) {
+  if (month !== null && (!Number.isInteger(month) || month < 1 || month > 12)) {
     return NextResponse.json({ error: "Month must be 1–12" }, { status: 400 });
   }
 
@@ -171,21 +160,24 @@ export async function POST(req: Request) {
 
   report.feasibility.b2bAuto = shouldFetchB2B;
   report.feasibility.b2cAuto = shouldFetchB2C;
-  report.feasibility.notes = [
-    shouldFetchB2B
-      ? "B2B: Auto-fetched from TimeDealer forsale feed. HKD quotes are kept in HKD — never converted."
-      : hasTimeDealerCreds
-        ? "B2B: Skipped for this run (dealer feed available)."
-        : "B2B: Add TIMEDEALER_PHONE + TIMEDEALER_PASSWORD in .env.local for auto dealer prices.",
-    shouldFetchB2C
-      ? "B2C: Chrono24 listing prices (before shipping), year-verified via details. Compare to the Chrono24 card price — not + shipping."
-      : "B2C: Add a ReefAPI key in Settings (or REEF_API_KEY in .env) for auto prices.",
-  ];
+  report.feasibility.b2bNote = shouldFetchB2B
+    ? "B2B: Dealer quotes from the TimeDealer forsale feed (last 90 days), cheapest first per currency. HKD quotes stay in HKD — never converted."
+    : hasTimeDealerCreds
+      ? "B2B: Skipped for this run (dealer feed available)."
+      : "B2B: Add TIMEDEALER_PHONE + TIMEDEALER_PASSWORD in .env.local for dealer quotes.";
+  report.feasibility.b2cNote = shouldFetchB2C
+    ? "B2C: Chrono24 listing prices (before shipping), year-verified via details. Compare to the Chrono24 card price — not + shipping."
+    : "B2C: Add a ReefAPI key in Settings (or REEF_API_KEY in .env) for auto prices.";
+
+  if (!shouldFetchB2B) {
+    const note = hasTimeDealerCreds ? "skipped this run" : "TimeDealer not connected";
+    report.b2b = report.b2b.map((entry) => ({ ...entry, note }));
+  }
 
   // Run dealer + Chrono24 in parallel so one slow provider doesn't block the other.
   await Promise.all([
-    shouldFetchB2B ? fillB2B(report) : Promise.resolve(),
-    shouldFetchB2C ? fillB2C(report, apiKey) : Promise.resolve(),
+    shouldFetchB2B ? fillB2B(report, deadline) : Promise.resolve(),
+    shouldFetchB2C ? fillB2C(report, apiKey, deadline) : Promise.resolve(),
   ]);
 
   return NextResponse.json({ report });

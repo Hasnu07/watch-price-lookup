@@ -1,25 +1,26 @@
 # Watch Price Check
 
-Dealer desk app for luxury watch market research. Enter a **full reference** and **year** (plus month when the watch is 2026). The app applies your B2B / B2C checklist and builds the send-ready report.
+Dealer desk app for luxury watch market research. Enter a **full reference** and **year** (month optional). The app applies your B2B / B2C checklist and builds the send-ready report.
 
 ## What it does
 
 | Step | In the app |
 | --- | --- |
 | Reference + dial | Normalizes the full reference; dial hint from the suffix (e.g. `-010`) |
-| Year rules | 2026 → check 2026 + 2025 (month matters). 2024/2025 → check 2024 + 2025 only (no 2026 comps) |
-| B2B | Deep link to [timedealer.io](https://timedealer.io) + fields for price / currency / source. **HKD stays HKD** |
-| B2C | Chrono24 links for lowest world, highest world, lowest UAE per comparison year |
-| Report | Copy-paste block matching your team template |
+| Year rules | Relative to the current year. Current year → check it + the year before (month optional, used to flag same-month quotes). Previous two years → check those two only (no current-year comps). Older → that year + the one before |
+| B2B | Price cards for **every** TimeDealer forsale quote (last 90 days): price, seller, phone / WhatsApp, group, dated, condition, dial, posted time, verified. Grouped by currency, cheapest first. **HKD stays HKD** |
+| B2C | Chrono24 lowest world, highest world, lowest UAE per comparison year (auto with ReefAPI, links otherwise) |
+| Report | Copy-paste block matching your team template, with the cheapest 3 dealer quotes per currency |
 
-## What can be fully automatic?
+## What is automatic?
 
-**Honest answer:**
+- **B2B (TimeDealer)** — automatic when `TIMEDEALER_PHONE` + `TIMEDEALER_PASSWORD` are set on the server. The app logs in once and reuses the session for 2 hours (re-login only if it expires), so it doesn't keep kicking your team's session.
+- **B2C (Chrono24)** — partially. Chrono24 blocks direct scraping (Cloudflare). With a [ReefAPI](https://reefapi.com/docs/chrono24) key the app fills lowest / highest world and, when a UAE seller is among the verified listings, lowest UAE. Otherwise confirm UAE via the UAE Chrono24 link.
+- Each check stops within ~50s. Anything a provider didn't return in time is marked, and the Chrono24 links are always there as a fallback.
 
-- **B2C (Chrono24)** — partially. Chrono24 blocks direct scraping (Cloudflare). With an optional [ReefAPI](https://reefapi.com/docs/chrono24) key, the app can auto-fill **lowest / highest world**. **Lowest UAE** still needs a quick check via the UAE Chrono24 link (country filter is not in that API).
-- **B2B (TimeDealer + dealer groups)** — **not automatic** without your team login. The app opens TimeDealer and you enter the quotes. That keeps dealer credentials and group chats off the server.
+## Deep links
 
-So day-to-day you still only type **reference + year** (and month for 2026), then fill B2B prices and confirm UAE — much faster than starting from a blank message.
+`/?ref=7118/1200A-010&year=2026&month=3&tab=b2b&autorun=1` fills the form and runs the check. Add `&b2b=0` to skip TimeDealer for that run. `tab` is `b2b`, `b2c` (default) or `report`.
 
 ## Run locally
 
