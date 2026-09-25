@@ -61,8 +61,11 @@ export type B2BYear = {
   /** Our target month — only set on the row for our own year. */
   month: number | null;
   quotes: B2BQuote[];
-  /** Matching quotes before the display cap. */
+  /** Listings seen (reposts merged, typos dropped) before the display cap. */
   totalFound: number;
+  dealerCount?: number;
+  /** TimeDealer has posts between the cheapest and priciest pages we read. */
+  moreAvailable?: boolean;
   status: "ok" | "empty" | "error" | "skipped";
   note?: string;
 };
@@ -113,8 +116,10 @@ const MONTH_NAMES = [
   "December",
 ];
 
-/** Quotes per currency listed in the copy-paste report (the UI shows all). */
-const REPORT_QUOTES_PER_CURRENCY = 3;
+/** Dealer quote cards per year: the cheapest ones plus the single highest. */
+export const MAX_B2B_CARDS = 10;
+/** Cheapest dealer quotes listed in the copy-paste report (plus the highest). */
+const REPORT_CHEAPEST_QUOTES = 3;
 
 export function normalizeReference(raw: string): string {
   return raw.trim().replace(/\s+/g, "").toUpperCase();
@@ -296,44 +301,41 @@ export function buildEmptyReport(
   };
 }
 
-const CURRENCY_ORDER = ["HKD", "USD"];
-
-function currencyRank(currency: string): number {
-  const i = CURRENCY_ORDER.indexOf(currency);
-  return i === -1 ? CURRENCY_ORDER.length : i;
+/**
+ * Comparable value across currencies: TimeDealer's own USD estimate. Only
+ * used for ordering — cards and the report keep the original currency.
+ */
+function comparableValue(quote: B2BQuote): number {
+  return quote.usdPrice ?? quote.price;
 }
 
-/** HKD first (Hong Kong market), then USD, then others; cheapest first within each. */
+/** Cheapest first, so HKD and USD quotes rank together. */
 export function sortQuotes(quotes: B2BQuote[]): B2BQuote[] {
-  return [...quotes].sort(
-    (a, b) =>
-      currencyRank(a.currency) - currencyRank(b.currency) ||
-      a.currency.localeCompare(b.currency) ||
-      a.price - b.price,
-  );
+  return [...quotes].sort((a, b) => comparableValue(a) - comparableValue(b));
 }
 
-export type CurrencyGroup = {
-  currency: string;
-  quotes: B2BQuote[];
-  low: number;
-  high: number;
-};
+/**
+ * Drop obvious price typos (an extra or missing zero) so they can't become
+ * the "lowest" or "highest": anything above 3× or below ⅓ of the median.
+ */
+export function dropPriceOutliers(quotes: B2BQuote[]): B2BQuote[] {
+  if (quotes.length < 4) return quotes;
+  const values = quotes.map(comparableValue).sort((a, b) => a - b);
+  const median = values[Math.floor(values.length / 2)]!;
+  return quotes.filter((q) => {
+    const value = comparableValue(q);
+    return value <= median * 3 && value >= median / 3;
+  });
+}
 
-/** Never mixes currencies — each group keeps its own prices, cheapest first. */
-export function groupQuotesByCurrency(quotes: B2BQuote[]): CurrencyGroup[] {
-  const groups = new Map<string, B2BQuote[]>();
-  for (const quote of sortQuotes(quotes)) {
-    const list = groups.get(quote.currency) ?? [];
-    list.push(quote);
-    groups.set(quote.currency, list);
-  }
-  return [...groups].map(([currency, list]) => ({
-    currency,
-    quotes: list,
-    low: list[0]!.price,
-    high: list[list.length - 1]!.price,
-  }));
+/** The cheapest (max − 1) quotes plus the single highest, in price order. */
+export function pickDisplayQuotes(
+  quotes: B2BQuote[],
+  max: number = MAX_B2B_CARDS,
+): B2BQuote[] {
+  const sorted = sortQuotes(quotes);
+  if (sorted.length <= max) return sorted;
+  return [...sorted.slice(0, max - 1), sorted[sorted.length - 1]!];
 }
 
 /** Month number from a TimeDealer release date like "2026-03" or "2026-03-14". */
@@ -387,20 +389,24 @@ export function formatReportText(report: ResearchReport): string {
       continue;
     }
     const count = entry.totalFound || entry.quotes.length;
-    lines.push(`  · ${ym}: ${count} dealer quote${count === 1 ? "" : "s"}`);
-    for (const group of groupQuotesByCurrency(entry.quotes)) {
-      const range =
-        group.low === group.high
-          ? formatMoney(group.low, group.currency)
-          : `${formatMoney(group.low, group.currency)} – ${formatMoney(group.high, group.currency)}`;
-      lines.push(`      ${group.currency} ×${group.quotes.length}: ${range}`);
-      for (const quote of group.quotes.slice(0, REPORT_QUOTES_PER_CURRENCY)) {
-        lines.push(
-          `        – ${formatMoney(quote.price, quote.currency)} · ${describeQuote(quote)}`,
-        );
-      }
-      const more = group.quotes.length - REPORT_QUOTES_PER_CURRENCY;
-      if (more > 0) lines.push(`        + ${more} more`);
+    const dealers = entry.dealerCount
+      ? ` from ${entry.dealerCount} dealer${entry.dealerCount === 1 ? "" : "s"}`
+      : "";
+    lines.push(
+      `  · ${ym}: ${count}${entry.moreAvailable ? "+" : ""} listing${count === 1 ? "" : "s"}${dealers}`,
+    );
+    const quotes = sortQuotes(entry.quotes);
+    const listed = quotes.slice(0, REPORT_CHEAPEST_QUOTES).map((quote, i) => ({
+      label: i === 0 ? "lowest" : `#${i + 1}`,
+      quote,
+    }));
+    if (quotes.length > REPORT_CHEAPEST_QUOTES) {
+      listed.push({ label: "highest", quote: quotes[quotes.length - 1]! });
+    }
+    for (const { label, quote } of listed) {
+      lines.push(
+        `      ${`${label}:`.padEnd(9)}${formatMoney(quote.price, quote.currency)} · ${describeQuote(quote)}`,
+      );
     }
   }
 

@@ -1,18 +1,27 @@
 import CryptoJS from "crypto-js";
 import { fetchWithTimeout, isAbortError, timeLeft } from "@/lib/http";
-import { sortQuotes, type B2BQuote } from "@/lib/watch-research";
+import {
+  dropPriceOutliers,
+  pickDisplayQuotes,
+  sortQuotes,
+  type B2BQuote,
+} from "@/lib/watch-research";
 
 const SECRET = "jgoteam@2024";
 const API_BASE = "https://timedealer.io/api";
 const DEFAULT_DEVICE_ID = "watch-price-research-device";
 /** Reuse one login instead of logging in (with force_login) on every search. */
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
-/** Quotes kept per year for the price cards. */
-const MAX_QUOTES_PER_YEAR = 60;
+/** The feed returns at most this many posts per page. */
+const FEED_PAGE_SIZE = 100;
 
 export type TimeDealerYearResult = {
+  /** Up to MAX_B2B_CARDS: the cheapest plus the highest. */
   quotes: B2BQuote[];
   totalFound: number;
+  dealerCount: number;
+  /** The feed has posts between the cheapest and priciest pages we read. */
+  moreAvailable?: boolean;
   error?: string;
   /** Session looked expired/invalid — caller should re-login and retry. */
   authFailed?: boolean;
@@ -235,6 +244,56 @@ function toQuote(raw: RawItem): B2BQuote | null {
   };
 }
 
+/**
+ * TimeDealer sometimes tags an HKD price as USD (e.g. "103000 USD" for a
+ * Submariner) while its own usd_price is correct. HKD is pegged at ~7.8/USD,
+ * so a USD-tagged price ~7.8× its usd_price is really HKD.
+ */
+function fixMislabelledHkd(quote: B2BQuote): B2BQuote {
+  if (quote.currency !== "USD" || !quote.usdPrice) return quote;
+  const ratio = quote.price / quote.usdPrice;
+  return ratio > 7.6 && ratio < 8 ? { ...quote, currency: "HKD" } : quote;
+}
+
+function moreSpecificDate(a: string | null, b: string | null): string | null {
+  return (b?.length ?? 0) > (a?.length ?? 0) ? b : a;
+}
+
+/**
+ * Dealers re-post the same watch many times; the feed returns each post as
+ * its own item. Collapse same dealer + price + currency + condition into one
+ * quote, keeping the latest post and counting the reposts.
+ */
+function mergeReposts(quotes: B2BQuote[]): B2BQuote[] {
+  const byKey = new Map<string, B2BQuote>();
+  for (const quote of quotes) {
+    const dealer = quote.sellerPhone || quote.seller;
+    const key = dealer
+      ? [dealer, quote.price, quote.currency, quote.condition ?? ""].join("|")
+      : quote.id;
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, quote);
+      continue;
+    }
+    const [newer, older] =
+      (quote.postedAt ?? "") > (prev.postedAt ?? "") ? [quote, prev] : [prev, quote];
+    byKey.set(key, {
+      ...newer,
+      releaseDate: moreSpecificDate(newer.releaseDate, older.releaseDate),
+      seller: newer.seller ?? older.seller,
+      sellerAvatar: newer.sellerAvatar ?? older.sellerAvatar,
+      group: newer.group ?? older.group,
+      color: newer.color ?? older.color,
+      note: newer.note ?? older.note,
+      image: newer.image ?? older.image,
+      verified: newer.verified || older.verified,
+      timesPosted: (newer.timesPosted ?? 1) + (older.timesPosted ?? 1),
+    });
+  }
+  return [...byKey.values()];
+}
+
 /** Map raw feed items to quotes for one reference + year, sorted for display. */
 export function parseTimeDealerItems(
   items: RawItem[],
@@ -242,23 +301,35 @@ export function parseTimeDealerItems(
 ): B2BQuote[] {
   const ref = opts.reference.toUpperCase();
   return sortQuotes(
-    items
-      .map(toQuote)
-      .filter((q): q is B2BQuote => Boolean(q))
-      .filter((q) => q.reference.toUpperCase().includes(ref))
-      .filter((q) => Boolean(q.releaseDate?.startsWith(String(opts.year)))),
+    mergeReposts(
+      items
+        .map(toQuote)
+        .filter((q): q is B2BQuote => Boolean(q))
+        .map(fixMislabelledHkd)
+        .filter((q) => q.reference.toUpperCase().includes(ref))
+        .filter((q) => Boolean(q.releaseDate?.startsWith(String(opts.year)))),
+    ),
   );
 }
 
-export async function searchTimeDealerForSale(opts: {
+type FeedPage = {
+  items: RawItem[];
+  full: boolean;
+  error?: string;
+  authFailed?: boolean;
+};
+
+/** One page (up to 100 posts) of the forsale feed, sorted by price. */
+async function fetchFeedPage(opts: {
   cookie: string;
   reference: string;
   year: number;
+  sort: "asc" | "desc";
   deadline: number;
-}): Promise<TimeDealerYearResult> {
+}): Promise<FeedPage> {
   const budget = Math.min(20_000, timeLeft(opts.deadline) - 500);
   if (budget < 2_000) {
-    return { quotes: [], totalFound: 0, error: "TimeDealer search skipped — out of time" };
+    return { items: [], full: false, error: "TimeDealer search skipped — out of time" };
   }
 
   const body = {
@@ -278,7 +349,7 @@ export async function searchTimeDealerForSale(opts: {
       reference_number: opts.reference,
       year: [opts.year, opts.year],
     },
-    sort: "asc",
+    sort: opts.sort,
     order: "Price",
     currency: "USD",
     type: 1, // forsale
@@ -301,36 +372,34 @@ export async function searchTimeDealerForSale(opts: {
       budget,
     );
     if (res.status === 401 || res.status === 403) {
-      return {
-        quotes: [],
-        totalFound: 0,
-        authFailed: true,
-        error: "TimeDealer session expired",
-      };
+      return { items: [], full: false, authFailed: true, error: "TimeDealer session expired" };
     }
     if (!res.ok) {
-      return { quotes: [], totalFound: 0, error: `TimeDealer search HTTP ${res.status}` };
+      return { items: [], full: false, error: `TimeDealer search HTTP ${res.status}` };
     }
-    const json = (await res.json()) as { items?: RawItem[]; message?: string };
+    const json = (await res.json()) as {
+      items?: RawItem[];
+      next_page?: unknown;
+      message?: string;
+    };
     if (!Array.isArray(json.items)) {
       // A valid search always carries an items array; anything else is
       // usually an expired session answered with HTTP 200.
       return {
-        quotes: [],
-        totalFound: 0,
+        items: [],
+        full: false,
         authFailed: true,
         error: json.message ? `TimeDealer: ${json.message}` : "TimeDealer returned no items",
       };
     }
-    const quotes = parseTimeDealerItems(json.items, opts);
     return {
-      quotes: quotes.slice(0, MAX_QUOTES_PER_YEAR),
-      totalFound: quotes.length,
+      items: json.items,
+      full: Boolean(json.next_page) || json.items.length >= FEED_PAGE_SIZE,
     };
   } catch (e) {
     return {
-      quotes: [],
-      totalFound: 0,
+      items: [],
+      full: false,
       error: isAbortError(e)
         ? "TimeDealer search timed out"
         : e instanceof Error
@@ -338,6 +407,46 @@ export async function searchTimeDealerForSale(opts: {
           : "TimeDealer search failed",
     };
   }
+}
+
+/**
+ * Cheapest and priciest pages in parallel, so the "highest" card is the real
+ * top of the market, not just the top of the cheapest 100 posts.
+ */
+export async function searchTimeDealerForSale(opts: {
+  cookie: string;
+  reference: string;
+  year: number;
+  deadline: number;
+}): Promise<TimeDealerYearResult> {
+  const [cheapest, priciest] = await Promise.all([
+    fetchFeedPage({ ...opts, sort: "asc" }),
+    fetchFeedPage({ ...opts, sort: "desc" }),
+  ]);
+  if (cheapest.error && priciest.error) {
+    return {
+      quotes: [],
+      totalFound: 0,
+      dealerCount: 0,
+      authFailed: cheapest.authFailed || priciest.authFailed,
+      error: cheapest.error,
+    };
+  }
+
+  // Both pages hold the same posts when there are fewer than a page's worth.
+  const items = new Map<string, RawItem>();
+  for (const item of [...cheapest.items, ...priciest.items]) {
+    items.set(String(item.item_id ?? JSON.stringify(item)), item);
+  }
+  const listings = dropPriceOutliers(parseTimeDealerItems([...items.values()], opts));
+
+  return {
+    quotes: pickDisplayQuotes(listings),
+    totalFound: listings.length,
+    dealerCount: new Set(listings.map((q) => q.sellerPhone || q.seller || q.id)).size,
+    // Two full pages may not meet in the middle.
+    moreAvailable: cheapest.full && priciest.full && items.size >= FEED_PAGE_SIZE * 2,
+  };
 }
 
 /** Dealer quotes for each comparison year, re-logging in once if the session expired. */

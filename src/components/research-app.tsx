@@ -32,11 +32,10 @@ import {
   MONTH_NAMES,
   formatMoney,
   formatReportText,
-  groupQuotesByCurrency,
   releaseMonth,
+  sortQuotes,
   type B2BQuote,
   type B2BYear,
-  type CurrencyGroup,
   type MarketListing,
   type ResearchReport,
 } from "@/lib/watch-research";
@@ -44,8 +43,6 @@ import { cn } from "@/lib/utils";
 
 const STORAGE_KEY = "watch-price-research:reef-key";
 const HISTORY_KEY = "watch-price-research:history";
-/** Quote cards shown per currency before "Show all". */
-const INITIAL_QUOTE_CARDS = 6;
 
 export type DeepLink = {
   reference: string;
@@ -102,6 +99,60 @@ function timeAgo(iso: string | null, nowIso: string): string | null {
   return relativeTime.format(Math.round(hours / 24), "day");
 }
 
+/** TimeDealer phones come as bare digits ("85291592153"). */
+function displayPhone(phone: string): string {
+  return /^\d{8,}$/.test(phone) ? `+${phone}` : phone;
+}
+
+/** Take the dealer half of a report from the B2B request. */
+function withB2BFrom(report: ResearchReport, from: ResearchReport): ResearchReport {
+  return {
+    ...report,
+    b2b: from.b2b,
+    feasibility: {
+      ...report.feasibility,
+      b2bAuto: from.feasibility.b2bAuto,
+      b2bNote: from.feasibility.b2bNote,
+    },
+  };
+}
+
+/** Take the Chrono24 half of a report from the B2C request. */
+function withB2CFrom(report: ResearchReport, from: ResearchReport): ResearchReport {
+  return {
+    ...report,
+    b2c: from.b2c,
+    feasibility: {
+      ...report.feasibility,
+      b2cAuto: from.feasibility.b2cAuto,
+      b2cNote: from.feasibility.b2cNote,
+    },
+  };
+}
+
+async function postResearch(
+  body: Record<string, unknown>,
+  signal: AbortSignal,
+): Promise<ResearchReport> {
+  const res = await fetch("/api/research", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    signal,
+    body: JSON.stringify(body),
+  });
+  // A gateway timeout can answer with an HTML page, not JSON.
+  const data = (await res.json().catch(() => null)) as {
+    report?: ResearchReport;
+    error?: string;
+  } | null;
+  if (!res.ok || !data?.report) {
+    throw new Error(
+      data?.error || `Research failed (HTTP ${res.status}). Retry in a moment.`,
+    );
+  }
+  return data.report;
+}
+
 function whatsappUrl(phone: string | null): string | null {
   const digits = phone?.replace(/\D/g, "") ?? "";
   return digits.length >= 8 ? `https://wa.me/${digits}` : null;
@@ -109,12 +160,12 @@ function whatsappUrl(phone: string | null): string | null {
 
 function QuoteCard({
   quote,
-  lowest,
+  rank,
   targetMonth,
   generatedAt,
 }: {
   quote: B2BQuote;
-  lowest: boolean;
+  rank: "lowest" | "highest" | null;
   targetMonth: number | null;
   generatedAt: string;
 }) {
@@ -144,7 +195,11 @@ function QuoteCard({
     <article
       className={cn(
         "flex flex-col gap-3 rounded-xl border bg-white/85 p-4",
-        lowest ? "border-teal-700/35 ring-1 ring-teal-700/15" : "border-ink/10",
+        rank === "lowest"
+          ? "border-teal-700/35 ring-1 ring-teal-700/15"
+          : rank === "highest"
+            ? "border-amber-700/30 ring-1 ring-amber-700/10"
+            : "border-ink/10",
       )}
     >
       <div className="flex items-start justify-between gap-3">
@@ -169,12 +224,13 @@ function QuoteCard({
         ) : null}
       </div>
 
-      {lowest || quote.verified || sameMonth ? (
+      {rank || quote.verified || sameMonth ? (
         <div className="flex flex-wrap gap-1.5">
-          {lowest ? (
-            <Badge className="bg-teal-800 text-white">
-              Lowest {quote.currency}
-            </Badge>
+          {rank === "lowest" ? (
+            <Badge className="bg-teal-800 text-white">Lowest</Badge>
+          ) : null}
+          {rank === "highest" ? (
+            <Badge className="bg-amber-800 text-white">Highest</Badge>
           ) : null}
           {quote.verified ? (
             <Badge variant="outline" className="border-teal-700/30 text-teal-900">
@@ -209,7 +265,7 @@ function QuoteCard({
           </p>
           {quote.sellerPhone ? (
             <p className="truncate text-xs tabular-nums text-ink/55">
-              {quote.sellerPhone}
+              {displayPhone(quote.sellerPhone)}
             </p>
           ) : null}
         </div>
@@ -249,58 +305,6 @@ function QuoteCard({
   );
 }
 
-function CurrencyGroupSection({
-  group,
-  targetMonth,
-  generatedAt,
-}: {
-  group: CurrencyGroup;
-  targetMonth: number | null;
-  generatedAt: string;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const visible = expanded
-    ? group.quotes
-    : group.quotes.slice(0, INITIAL_QUOTE_CARDS);
-  const count = group.quotes.length;
-
-  return (
-    <section className="space-y-3">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <p className="text-sm font-semibold text-ink">
-          {group.currency} · {count} quote{count === 1 ? "" : "s"}
-        </p>
-        <p className="text-sm tabular-nums text-ink/70">
-          {group.low === group.high
-            ? formatMoney(group.low, group.currency)
-            : `${formatMoney(group.low, group.currency)} – ${formatMoney(group.high, group.currency)}`}
-        </p>
-      </div>
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {visible.map((quote, i) => (
-          <QuoteCard
-            key={`${quote.id}-${i}`}
-            quote={quote}
-            lowest={i === 0}
-            targetMonth={targetMonth}
-            generatedAt={generatedAt}
-          />
-        ))}
-      </div>
-      {count > INITIAL_QUOTE_CARDS ? (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => setExpanded((v) => !v)}
-        >
-          {expanded ? "Show fewer" : `Show all ${count} ${group.currency} quotes`}
-        </Button>
-      ) : null}
-    </section>
-  );
-}
-
 function B2BYearCard({
   entry,
   generatedAt,
@@ -308,8 +312,10 @@ function B2BYearCard({
   entry: B2BYear;
   generatedAt: string;
 }) {
-  const groups = groupQuotesByCurrency(entry.quotes);
-  const count = entry.totalFound || entry.quotes.length;
+  const quotes = sortQuotes(entry.quotes);
+  const count = entry.totalFound || quotes.length;
+  const dealers =
+    entry.dealerCount ?? new Set(quotes.map((q) => q.sellerPhone || q.seller)).size;
 
   return (
     <Card className="border-ink/10 bg-white/75 shadow-none">
@@ -319,21 +325,28 @@ function B2BYearCard({
           {entry.month ? ` · ${MONTH_NAMES[entry.month - 1]}` : ""}
         </CardTitle>
         <CardDescription>
-          {groups.length
-            ? `${count} forsale quote${count === 1 ? "" : "s"} on TimeDealer, cheapest first in each currency.${
-                count > entry.quotes.length
-                  ? ` Showing the first ${entry.quotes.length}.`
+          {quotes.length
+            ? `${count}${entry.moreAvailable ? "+" : ""} listing${count === 1 ? "" : "s"} from ${dealers} dealer${dealers === 1 ? "" : "s"} on TimeDealer (last 90 days, reposts merged).${
+                count > quotes.length
+                  ? ` Showing the ${quotes.length - 1} cheapest and the highest.`
                   : ""
               }`
             : sentence(entry.note || "No dealer quotes yet.")}
         </CardDescription>
       </CardHeader>
-      {groups.length ? (
-        <CardContent className="space-y-6">
-          {groups.map((group) => (
-            <CurrencyGroupSection
-              key={group.currency}
-              group={group}
+      {quotes.length ? (
+        <CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {quotes.map((quote, i) => (
+            <QuoteCard
+              key={`${quote.id}-${i}`}
+              quote={quote}
+              rank={
+                i === 0
+                  ? "lowest"
+                  : i === quotes.length - 1
+                    ? "highest"
+                    : null
+              }
               targetMonth={entry.month}
               generatedAt={generatedAt}
             />
@@ -468,9 +481,12 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
   const [copied, setCopied] = useState(false);
   const [historyRaw, setHistoryRaw] = useLocalStorage(HISTORY_KEY);
   const history = useMemo(() => parseHistory(historyRaw), [historyRaw]);
-  const [pending, setPending] = useState(false);
+  const [b2bPending, setB2bPending] = useState(false);
+  const [b2cPending, setB2cPending] = useState(false);
+  const pending = b2bPending || b2cPending;
   const [tab, setTab] = useState<string>(initial.tab);
   const autoRan = useRef(false);
+  const runId = useRef(0);
 
   const yearNum = Number(year);
 
@@ -520,51 +536,69 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
       setError("Reference is required.");
       return;
     }
+    const id = ++runId.current;
+    const isCurrent = () => runId.current === id;
+    const withDealers = !opts?.skipB2B;
     setError(null);
     setCopied(false);
-    setPending(true);
+    setReport(null);
+    setB2bPending(withDealers);
+    setB2cPending(true);
+
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 65_000);
-    try {
-      const res = await fetch("/api/research", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          reference: ref,
-          year: yearNum,
-          month: month ? Number(month) : null,
-          dial: dial || undefined,
-          reefApiKey: reefKey || undefined,
-          autoFetchB2C: true,
-          autoFetchB2B: opts?.skipB2B ? false : undefined,
-        }),
-      });
-      // A gateway timeout can answer with an HTML page, not JSON.
-      const data = (await res.json().catch(() => null)) as {
-        report?: ResearchReport;
-        error?: string;
-      } | null;
-      if (!res.ok || !data?.report) {
-        setError(
-          data?.error || `Research failed (HTTP ${res.status}). Retry in a moment.`,
+    const base = {
+      reference: ref,
+      year: yearNum,
+      month: month ? Number(month) : null,
+      dial: dial || undefined,
+    };
+    const errors: string[] = [];
+    let recorded = false;
+
+    // Dealer quotes (~5s) and Chrono24 (slower) load as separate requests;
+    // results show as soon as either half lands.
+    async function load(
+      part: "b2b" | "b2c",
+      body: Record<string, unknown>,
+      done: (value: boolean) => void,
+    ) {
+      try {
+        const partReport = await postResearch(body, controller.signal);
+        if (!isCurrent()) return;
+        setReport((prev) =>
+          part === "b2b"
+            ? withB2BFrom(prev ?? partReport, partReport)
+            : withB2CFrom(prev ?? partReport, partReport),
         );
-        return;
-      }
-      setReport(data.report);
-      pushHistory(data.report.reference, data.report.year, data.report.month);
-    } catch (e) {
-      if (e instanceof DOMException && e.name === "AbortError") {
-        setError(
-          "Research timed out after 65s. Retry, or use Open Chrono24 links for B2C.",
+        if (!recorded) {
+          recorded = true;
+          pushHistory(partReport.reference, partReport.year, partReport.month);
+        }
+      } catch (e) {
+        const label = part === "b2b" ? "Dealer quotes" : "Chrono24";
+        errors.push(
+          e instanceof DOMException && e.name === "AbortError"
+            ? `${label} timed out after 65s.`
+            : `${label}: ${e instanceof Error ? e.message : "network error"}`,
         );
-      } else {
-        setError(e instanceof Error ? e.message : "Network error");
+      } finally {
+        if (isCurrent()) done(false);
       }
-    } finally {
-      window.clearTimeout(timer);
-      setPending(false);
     }
+
+    await Promise.all([
+      withDealers
+        ? load("b2b", { ...base, autoFetchB2C: false }, setB2bPending)
+        : null,
+      load(
+        "b2c",
+        { ...base, reefApiKey: reefKey || undefined, autoFetchB2B: false },
+        setB2cPending,
+      ),
+    ]);
+    window.clearTimeout(timer);
+    if (isCurrent() && errors.length) setError(errors.join(" "));
   }
 
   useEffect(() => {
@@ -742,7 +776,9 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                 </Button>
                 {pending ? (
                   <p className="text-xs text-ink/60">
-                    Checking TimeDealer + Chrono24 — usually under 45s.
+                    {report && !b2bPending
+                      ? "Dealer quotes ready — Chrono24 still loading."
+                      : "Checking TimeDealer + Chrono24 — dealer quotes first."}
                   </p>
                 ) : null}
               </div>
@@ -832,17 +868,25 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
 
             <Tabs value={tab} onValueChange={setTab} className="gap-4">
               <TabsList className="bg-white/60">
-                <TabsTrigger value="b2b">B2B · dealers</TabsTrigger>
-                <TabsTrigger value="b2c">B2C · Chrono24</TabsTrigger>
+                <TabsTrigger value="b2b">
+                  B2B · dealers
+                  {b2bPending ? <Loader2 className="size-3 animate-spin" /> : null}
+                </TabsTrigger>
+                <TabsTrigger value="b2c">
+                  B2C · Chrono24
+                  {b2cPending ? <Loader2 className="size-3 animate-spin" /> : null}
+                </TabsTrigger>
                 <TabsTrigger value="report">Report</TabsTrigger>
               </TabsList>
 
               <TabsContent value="b2b" className="space-y-4">
-                <Alert className={noteTone(report.feasibility.b2bNote)}>
-                  <AlertDescription className="break-words text-sm leading-relaxed">
-                    {report.feasibility.b2bNote}
-                  </AlertDescription>
-                </Alert>
+                {b2bPending ? null : (
+                  <Alert className={noteTone(report.feasibility.b2bNote)}>
+                    <AlertDescription className="break-words text-sm leading-relaxed">
+                      {report.feasibility.b2bNote}
+                    </AlertDescription>
+                  </Alert>
+                )}
                 <a
                   href={report.links.timedealer}
                   target="_blank"
@@ -851,23 +895,41 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                 >
                   Open TimeDealer <ExternalLink className="size-4" />
                 </a>
-                {report.b2b.map((entry) => (
-                  <B2BYearCard
-                    key={entry.year}
-                    entry={entry}
-                    generatedAt={report.generatedAt}
-                  />
-                ))}
+                {b2bPending ? (
+                  <Card className="border-ink/10 bg-white/75 shadow-none">
+                    <CardContent className="flex items-center gap-2 py-6 text-sm text-ink/70">
+                      <Loader2 className="size-4 animate-spin" />
+                      Loading TimeDealer quotes…
+                    </CardContent>
+                  </Card>
+                ) : (
+                  report.b2b.map((entry) => (
+                    <B2BYearCard
+                      key={entry.year}
+                      entry={entry}
+                      generatedAt={report.generatedAt}
+                    />
+                  ))
+                )}
               </TabsContent>
 
               <TabsContent value="b2c" className="space-y-4">
-                <Alert className={noteTone(report.feasibility.b2cNote)}>
-                  <AlertDescription className="break-words text-sm leading-relaxed">
-                    {report.feasibility.b2cNote.length > 280
-                      ? `${report.feasibility.b2cNote.slice(0, 280)}…`
-                      : report.feasibility.b2cNote}
-                  </AlertDescription>
-                </Alert>
+                {b2cPending ? (
+                  <Alert className="border-teal-200/80 bg-teal-50/60 text-ink">
+                    <AlertDescription className="flex items-center gap-2 text-sm leading-relaxed">
+                      <Loader2 className="size-4 shrink-0 animate-spin" />
+                      Checking Chrono24… The Open Chrono24 links below already work.
+                    </AlertDescription>
+                  </Alert>
+                ) : (
+                  <Alert className={noteTone(report.feasibility.b2cNote)}>
+                    <AlertDescription className="break-words text-sm leading-relaxed">
+                      {report.feasibility.b2cNote.length > 280
+                        ? `${report.feasibility.b2cNote.slice(0, 280)}…`
+                        : report.feasibility.b2cNote}
+                    </AlertDescription>
+                  </Alert>
+                )}
 
                 {report.yearPlan.yearsToCheck.map((y) => {
                   const bucket = report.b2c.byYear[y];

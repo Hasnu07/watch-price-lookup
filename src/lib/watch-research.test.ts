@@ -6,10 +6,11 @@ import {
   buildEmptyReport,
   buildYearPlan,
   chrono24SearchUrl,
+  dropPriceOutliers,
   extractDialHint,
   formatReportText,
-  groupQuotesByCurrency,
   normalizeReference,
+  pickDisplayQuotes,
   type B2BQuote,
 } from "./watch-research";
 
@@ -128,23 +129,33 @@ describe("sanitizeApiError", () => {
   });
 });
 
-describe("groupQuotesByCurrency", () => {
-  it("puts HKD first, never mixes currencies, cheapest first", () => {
-    const groups = groupQuotesByCurrency([
-      quote({ currency: "USD", price: 190_000 }),
-      quote({ currency: "HKD", price: 1_500_000 }),
-      quote({ currency: "AED", price: 700_000 }),
-      quote({ currency: "HKD", price: 1_450_000 }),
-      quote({ currency: "USD", price: 185_000 }),
-    ]);
-    assert.deepEqual(
-      groups.map((g) => [g.currency, g.low, g.high, g.quotes.length]),
-      [
-        ["HKD", 1_450_000, 1_500_000, 2],
-        ["USD", 185_000, 190_000, 2],
-        ["AED", 700_000, 700_000, 1],
-      ],
+describe("pickDisplayQuotes", () => {
+  it("shows at most 10: the 9 cheapest plus the highest, ranked across currencies", () => {
+    const quotes = Array.from({ length: 14 }, (_, i) =>
+      quote({ id: `q${i}`, price: 100_000 + i * 1_000, usdPrice: 12_800 + i * 128 }),
     );
+    quotes.push(quote({ id: "usd", currency: "USD", price: 12_000, usdPrice: 12_000 }));
+    const shown = pickDisplayQuotes(quotes);
+    assert.equal(shown.length, 10);
+    assert.equal(shown[0]!.id, "usd"); // cheapest by USD value, still shown in USD
+    assert.equal(shown[8]!.id, "q7");
+    assert.equal(shown[9]!.id, "q13"); // the highest is always there
+  });
+
+  it("returns everything when there are 10 or fewer", () => {
+    assert.equal(pickDisplayQuotes([quote({}), quote({})]).length, 2);
+  });
+});
+
+describe("dropPriceOutliers", () => {
+  it("drops extra-zero typos so they cannot become the highest", () => {
+    const normal = [103_000, 105_000, 108_000, 112_000, 117_000].map((p) =>
+      quote({ price: p, usdPrice: p / 7.8 }),
+    );
+    const typo = quote({ id: "typo", price: 1_030_000, usdPrice: 1_030_000 / 7.8 });
+    const kept = dropPriceOutliers([...normal, typo]);
+    assert.equal(kept.length, 5);
+    assert.ok(kept.every((q) => q.id !== "typo"));
   });
 });
 
@@ -186,6 +197,50 @@ describe("parseTimeDealerItems", () => {
   });
 });
 
+describe("parseTimeDealerItems reposts + currency", () => {
+  // Pattern seen live for 126610LN: one dealer posting the same HKD 103,000
+  // watch many times, some posts mis-tagged USD (usd_price shows it is HKD).
+  const post = (id: number, extra: Record<string, unknown>) => ({
+    item_id: id,
+    ref: "126610LN-0001",
+    price: 103_000,
+    currency: "HKD",
+    usd_price: 13_143,
+    release_date: "2024-08",
+    sender_name: "lucky",
+    sender_phone: "85291592153",
+    condition: "used",
+    posted_time: `2026-07-0${id}T10:00:00Z`,
+    ...extra,
+  });
+
+  it("relabels USD-tagged HKD prices and merges reposts into one quote", () => {
+    const quotes = parseTimeDealerItems(
+      [
+        post(1, {}),
+        post(2, { currency: "USD", usd_price: 13_205 }),
+        post(3, { release_date: "2024", duplicate_count: 2 }),
+        post(4, { price: 112_000, usd_price: 14_330 }),
+        post(5, { sender_phone: "85290000000", sender_name: "Ryan" }),
+        post(6, { currency: "USD", price: 13_500, usd_price: 13_500, sender_phone: "1555" }),
+      ],
+      { reference: "126610LN", year: 2024 },
+    );
+    const summary = quotes.map(
+      (q) => `${q.seller} ${q.currency} ${q.price} ×${q.timesPosted ?? 1}`,
+    );
+    assert.deepEqual(summary, [
+      "lucky HKD 103000 ×5", // posts 1, 2 (was USD), 3 (counted 3×)
+      "Ryan HKD 103000 ×1",
+      "lucky USD 13500 ×1", // genuine USD quote stays USD, ranked by USD value
+      "lucky HKD 112000 ×1",
+    ]);
+    const merged = quotes[0]!;
+    assert.equal(merged.releaseDate, "2024-08"); // keeps the more specific date
+    assert.equal(merged.postedAt, "2026-07-03T10:00:00.000Z"); // latest post
+  });
+});
+
 describe("formatReportText", () => {
   it("includes reference, years, and pending markers", () => {
     const report = buildEmptyReport({
@@ -199,7 +254,7 @@ describe("formatReportText", () => {
     assert.match(text, /PENDING/);
   });
 
-  it("lists several dealer quotes per currency with seller names, HKD kept in HKD", () => {
+  it("lists the 3 lowest and the highest dealer quotes with sellers, HKD kept in HKD", () => {
     const report = buildEmptyReport(
       { reference: "7118/1200A-010", year: 2026, month: 3 },
       2026,
@@ -207,23 +262,29 @@ describe("formatReportText", () => {
     report.b2b[0] = {
       ...report.b2b[0]!,
       status: "ok",
-      totalFound: 5,
+      totalFound: 24,
+      dealerCount: 17,
       quotes: [
-        quote({ price: 1_450_000, seller: "Dealer A", group: "HK Group", releaseDate: "2026-03" }),
-        quote({ price: 1_480_000, seller: "Dealer B", releaseDate: "2026-02" }),
-        quote({ price: 1_500_000, seller: "Dealer C" }),
-        quote({ price: 1_520_000, seller: "Dealer D" }),
-        quote({ price: 185_000, currency: "USD", seller: "Dealer E" }),
+        quote({ price: 1_500_000, usdPrice: 192_300, seller: "Dealer C" }),
+        quote({
+          price: 1_450_000,
+          usdPrice: 185_900,
+          seller: "Dealer A",
+          group: "HK Group",
+          releaseDate: "2026-03",
+        }),
+        quote({ price: 1_520_000, usdPrice: 194_900, seller: "Dealer D" }),
+        quote({ price: 1_480_000, usdPrice: 189_700, seller: "Dealer B", releaseDate: "2026-02" }),
+        quote({ price: 1_690_000, usdPrice: 216_700, seller: "Dealer Z" }),
       ],
     };
     const text = formatReportText(report);
     assert.match(text, /Year: 2026 \(March\)/);
-    assert.match(text, /2026\/03: 5 dealer quotes/);
-    assert.match(text, /HKD ×4: HK\$1,450,000 – HK\$1,520,000/);
-    assert.match(text, /HK\$1,450,000 · Dealer A · HK Group · dated 2026-03/);
-    assert.match(text, /Dealer C/);
-    assert.doesNotMatch(text, /Dealer D/); // beyond the 3 listed per currency
-    assert.match(text, /\+ 1 more/);
-    assert.match(text, /USD ×1: \$185,000/);
+    assert.match(text, /2026\/03: 24 listings from 17 dealers/);
+    assert.match(text, /lowest: +HK\$1,450,000 · Dealer A · HK Group · dated 2026-03/);
+    assert.match(text, /#2: +HK\$1,480,000 · Dealer B/);
+    assert.match(text, /#3: +HK\$1,500,000 · Dealer C/);
+    assert.doesNotMatch(text, /Dealer D/);
+    assert.match(text, /highest: +HK\$1,690,000 · Dealer Z/);
   });
 });

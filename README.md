@@ -8,15 +8,15 @@ Dealer desk app for luxury watch market research. Enter a **full reference** and
 | --- | --- |
 | Reference + dial | Normalizes the full reference; dial hint from the suffix (e.g. `-010`) |
 | Year rules | Relative to the current year. Current year → check it + the year before (month optional, used to flag same-month quotes). Previous two years → check those two only (no current-year comps). Older → that year + the one before |
-| B2B | Price cards for **every** TimeDealer forsale quote (last 90 days): price, seller, phone / WhatsApp, group, dated, condition, dial, posted time, verified. Grouped by currency, cheapest first. **HKD stays HKD** |
+| B2B | Up to 10 TimeDealer price cards per year (last 90 days): the 9 cheapest plus the highest. Seller, phone / WhatsApp, group, dated, condition, dial, posted time, verified. Reposts are merged, price typos dropped, HKD mislabelled as USD fixed. **HKD stays HKD** |
 | B2C | Chrono24 lowest world, highest world, lowest UAE per comparison year (auto with ReefAPI, links otherwise) |
-| Report | Copy-paste block matching your team template, with the cheapest 3 dealer quotes per currency |
+| Report | Copy-paste block matching your team template: lowest, #2, #3 and highest dealer quote per year |
 
 ## What is automatic?
 
 - **B2B (TimeDealer)** — automatic when `TIMEDEALER_PHONE` + `TIMEDEALER_PASSWORD` are set on the server. The app logs in once and reuses the session for 2 hours (re-login only if it expires), so it doesn't keep kicking your team's session.
 - **B2C (Chrono24)** — partially. Chrono24 blocks direct scraping (Cloudflare). With a [ReefAPI](https://reefapi.com/docs/chrono24) key the app fills lowest / highest world and, when a UAE seller is among the verified listings, lowest UAE. Otherwise confirm UAE via the UAE Chrono24 link.
-- Each check stops within ~50s. Anything a provider didn't return in time is marked, and the Chrono24 links are always there as a fallback.
+- Dealer quotes and Chrono24 load separately: dealer cards show in ~5s while Chrono24 keeps loading. Chrono24 listings are verified in parallel waves, and repeat checks of the same watch are cached for 20 minutes. Each check stops within ~50s at worst; the Chrono24 links are always there as a fallback.
 
 ## Deep links
 

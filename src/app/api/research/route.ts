@@ -52,6 +52,8 @@ async function fillB2B(report: ResearchReport, deadline: number): Promise<void> 
       status: "ok",
       quotes: found.quotes,
       totalFound: found.totalFound,
+      dealerCount: found.dealerCount,
+      moreAvailable: found.moreAvailable,
     };
   });
 }
@@ -66,7 +68,6 @@ async function fillB2C(
     query: report.reference,
     years: report.yearPlan.yearsToCheck,
     deadline,
-    detailLimit: 28,
   });
 
   if (verified.error) {

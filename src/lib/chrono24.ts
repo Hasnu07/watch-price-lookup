@@ -3,6 +3,13 @@ import type { MarketListing } from "@/lib/watch-research";
 
 const OUT_OF_TIME =
   "Stopped at the time limit — some Chrono24 prices may be missing. Use the Open Chrono24 year links.";
+/** Listings opened per wave from each end (cheapest / priciest). */
+const DETAIL_WAVE = 4;
+/** Waves per end before settling (so at most 16 detail calls per year). */
+const MAX_WAVES = 2;
+const DETAIL_TTL_MS = 6 * 60 * 60 * 1000;
+const YEAR_TTL_MS = 20 * 60 * 1000;
+const MAX_CACHED_DETAILS = 2_000;
 
 type ReefSearchResponse = {
   ok?: boolean;
@@ -51,17 +58,16 @@ export type Chrono24FetchResult = {
   error?: string;
 };
 
+type YearMarket = {
+  lowestWorld: MarketListing | null;
+  highestWorld: MarketListing | null;
+  lowestUae: MarketListing | null;
+  verifiedCount: number;
+  note?: string;
+};
+
 export type VerifiedChrono24Market = {
-  byYear: Record<
-    number,
-    {
-      lowestWorld: MarketListing | null;
-      highestWorld: MarketListing | null;
-      lowestUae: MarketListing | null;
-      verifiedCount: number;
-      note?: string;
-    }
-  >;
+  byYear: Record<number, YearMarket>;
   error?: string;
 };
 
@@ -255,9 +261,43 @@ function isUae(listing: MarketListing): boolean {
 }
 
 /**
+ * Listing details barely change, so they're shared across requests (and
+ * across both comparison years, whose searches overlap). In-flight lookups
+ * are shared too; failed ones are dropped so they can be retried.
+ */
+const detailCache = new Map<string, { at: number; listing: Promise<MarketListing | null> }>();
+
+function cachedDetail(
+  apiKey: string,
+  listingId: string,
+  deadline: number,
+): Promise<MarketListing | null> {
+  const hit = detailCache.get(listingId);
+  if (hit && Date.now() - hit.at < DETAIL_TTL_MS) return hit.listing;
+  const listing = reefDetail(apiKey, listingId, deadline);
+  detailCache.set(listingId, { at: Date.now(), listing });
+  void listing.then((d) => {
+    if (!d) detailCache.delete(listingId);
+  });
+  // Maps iterate in insertion order: drop the oldest entries first.
+  for (const key of detailCache.keys()) {
+    if (detailCache.size <= MAX_CACHED_DETAILS) break;
+    detailCache.delete(key);
+  }
+  return listing;
+}
+
+/** Finished year results, so re-running the same watch is instant. */
+const yearCache = new Map<string, { at: number; market: YearMarket }>();
+
+/**
  * ReefAPI's `year` filter is ignored, but appending the year to the query
  * (Chrono24 search bar style: "5726A-001 2026") returns year-relevant hits.
  * We still verify Year of production via detail before quoting.
+ *
+ * Speed: both searches run together, then listings are opened in parallel
+ * waves from the cheap and pricey ends at once, stopping as soon as each end
+ * has a year-verified match. Lowest UAE comes from listings already opened.
  */
 export async function fetchChrono24VerifiedByYears(opts: {
   apiKey: string;
@@ -265,113 +305,93 @@ export async function fetchChrono24VerifiedByYears(opts: {
   years: number[];
   /** Epoch ms by which we must return, with whatever was verified so far. */
   deadline: number;
-  detailLimit?: number;
 }): Promise<VerifiedChrono24Market> {
-  const { deadline } = opts;
+  const { apiKey, deadline } = opts;
   const years = [...new Set(opts.years)].sort();
-  const byYear: VerifiedChrono24Market["byYear"] = {};
-  for (const y of years) {
-    byYear[y] = {
+
+  async function verifyYear(y: number): Promise<YearMarket> {
+    const cacheKey = `${opts.query.toUpperCase()}|${y}`;
+    const cached = yearCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < YEAR_TTL_MS) {
+      const minutes = Math.max(1, Math.round((Date.now() - cached.at) / 60_000));
+      return {
+        ...cached.market,
+        note: `${cached.market.note ?? ""} From a check ${minutes} min ago.`.trim(),
+      };
+    }
+
+    const yearQuery = `${opts.query} ${y}`;
+    const [asc, desc] = await Promise.all([
+      reefSearch({ apiKey, query: yearQuery, sort: "price_asc", deadline, attempts: 2 }),
+      reefSearch({ apiKey, query: yearQuery, sort: "price_desc", deadline, attempts: 2 }),
+    ]);
+    const empty: YearMarket = {
       lowestWorld: null,
       highestWorld: null,
       lowestUae: null,
       verifiedCount: 0,
     };
+    if (asc.error && desc.error) return { ...empty, note: asc.error || desc.error };
+
+    let outOfTime = false;
+    const cheapEndDetails: MarketListing[] = [];
+    const allDetails = new Map<string, MarketListing>();
+
+    async function firstMatch(
+      listings: MarketListing[],
+      opened: MarketListing[],
+    ): Promise<MarketListing | null> {
+      for (let wave = 0; wave < MAX_WAVES; wave++) {
+        const batch = listings.slice(wave * DETAIL_WAVE, (wave + 1) * DETAIL_WAVE);
+        if (!batch.length) break;
+        if (timeLeft(deadline) < 1_500) {
+          outOfTime = true;
+          break;
+        }
+        const details = await Promise.all(
+          batch.map((l) => cachedDetail(apiKey, l.id, deadline)),
+        );
+        for (const d of details) {
+          if (!d) continue;
+          opened.push(d);
+          allDetails.set(d.id, d);
+        }
+        // Keep search order: the first exact-year hit is the cheapest/priciest.
+        const exact = details.find((d) => d && matchesExactYear(d, y, false));
+        if (exact) return exact;
+      }
+      return opened.find((d) => matchesExactYear(d, y, true)) ?? null;
+    }
+
+    const [lowestWorld, highestWorld] = await Promise.all([
+      firstMatch(asc.listings, cheapEndDetails),
+      firstMatch(desc.listings, []),
+    ]);
+    const lowestUae =
+      cheapEndDetails
+        .filter((d) => isUae(d) && matchesExactYear(d, y, true))
+        .sort((a, b) => a.price - b.price)[0] ?? null;
+    const verifiedCount = [...allDetails.values()].filter((d) =>
+      matchesExactYear(d, y, true),
+    ).length;
+
+    const market: YearMarket = {
+      lowestWorld,
+      highestWorld,
+      lowestUae,
+      verifiedCount,
+      note: outOfTime
+        ? OUT_OF_TIME
+        : !lowestWorld && !highestWorld
+          ? `No Chrono24 listings verified for year ${y}. Use the year-filtered Chrono24 link.`
+          : `Year ${y} search verified via Chrono24 details. Listing price before shipping.`,
+    };
+    if (!outOfTime && !asc.error && !desc.error) {
+      yearCache.set(cacheKey, { at: Date.now(), market });
+    }
+    return market;
   }
 
-  const maxDetailsPerYear = Math.max(
-    8,
-    Math.floor((opts.detailLimit ?? 24) / Math.max(years.length, 1)),
-  );
-
-  await Promise.all(
-    years.map(async (y) => {
-      const yearQuery = `${opts.query} ${y}`;
-      const [asc, desc] = await Promise.all([
-        reefSearch({
-          apiKey: opts.apiKey,
-          query: yearQuery,
-          sort: "price_asc",
-          deadline,
-          attempts: 2,
-        }),
-        reefSearch({
-          apiKey: opts.apiKey,
-          query: yearQuery,
-          sort: "price_desc",
-          deadline,
-          attempts: 2,
-        }),
-      ]);
-
-      if (asc.error && desc.error) {
-        byYear[y]!.note = asc.error || desc.error;
-        return;
-      }
-
-      const detailCache = new Map<string, MarketListing | null>();
-      let calls = 0;
-      let outOfTime = false;
-      const canFetchMore = () => {
-        if (timeLeft(deadline) < 1_500) outOfTime = true;
-        return calls < maxDetailsPerYear && !outOfTime;
-      };
-
-      async function detailCached(id: string): Promise<MarketListing | null> {
-        if (detailCache.has(id)) return detailCache.get(id)!;
-        if (!canFetchMore()) return null;
-        calls += 1;
-        const d = await reefDetail(opts.apiKey, id, deadline);
-        detailCache.set(id, d);
-        return d;
-      }
-
-      async function firstMatch(
-        listings: MarketListing[],
-        pred: (d: MarketListing) => boolean,
-      ): Promise<MarketListing | null> {
-        const batchSize = 3;
-        for (let i = 0; i < listings.length && canFetchMore(); i += batchSize) {
-          const batch = listings.slice(i, i + batchSize);
-          const details = await Promise.all(batch.map((l) => detailCached(l.id)));
-          for (const d of details) {
-            if (d && matchesExactYear(d, y, false) && pred(d)) return d;
-          }
-        }
-        // Approximation fallback
-        for (let i = 0; i < listings.length && canFetchMore(); i += batchSize) {
-          const batch = listings.slice(i, i + batchSize);
-          const details = await Promise.all(batch.map((l) => detailCached(l.id)));
-          for (const d of details) {
-            if (d && matchesExactYear(d, y, true) && pred(d)) return d;
-          }
-        }
-        return null;
-      }
-
-      const lowestWorld = await firstMatch(asc.listings, () => true);
-      const highestWorld = await firstMatch(desc.listings, () => true);
-      const lowestUae =
-        (lowestWorld && isUae(lowestWorld) ? lowestWorld : null) ||
-        (await firstMatch(asc.listings, isUae));
-
-      const verified = [...detailCache.values()].filter(
-        (d): d is MarketListing => Boolean(d && matchesExactYear(d, y, true)),
-      );
-
-      byYear[y] = {
-        lowestWorld,
-        highestWorld,
-        lowestUae,
-        verifiedCount: verified.length,
-        note: outOfTime
-          ? OUT_OF_TIME
-          : !lowestWorld && !highestWorld
-            ? `No Chrono24 listings verified for year ${y}. Use the year-filtered Chrono24 link.`
-            : `Year ${y} search verified via Chrono24 details. Listing price before shipping.`,
-      };
-    }),
-  );
-
-  return { byYear };
+  const markets = await Promise.all(years.map(verifyYear));
+  return { byYear: Object.fromEntries(years.map((y, i) => [y, markets[i]!])) };
 }
