@@ -117,16 +117,34 @@ function withB2BFrom(report: ResearchReport, from: ResearchReport): ResearchRepo
   };
 }
 
-/** Take the Chrono24 half of a report from the B2C request. */
-function withB2CFrom(report: ResearchReport, from: ResearchReport): ResearchReport {
+/**
+ * Take Chrono24 slices from a partial report: lowest/highest come from the
+ * fast "prices" request, lowest UAE from the slower "uae" request.
+ */
+function withChrono24From(
+  report: ResearchReport,
+  from: ResearchReport,
+  part: "prices" | "uae",
+): ResearchReport {
+  const byYear = { ...report.b2c.byYear };
+  for (const [y, slices] of Object.entries(from.b2c.byYear)) {
+    const current = byYear[Number(y)] ?? slices;
+    byYear[Number(y)] =
+      part === "prices"
+        ? { ...current, lowestWorld: slices.lowestWorld, highestWorld: slices.highestWorld }
+        : { ...current, lowestUae: slices.lowestUae };
+  }
   return {
     ...report,
-    b2c: from.b2c,
-    feasibility: {
-      ...report.feasibility,
-      b2cAuto: from.feasibility.b2cAuto,
-      b2cNote: from.feasibility.b2cNote,
-    },
+    b2c: { byYear },
+    feasibility:
+      part === "prices"
+        ? {
+            ...report.feasibility,
+            b2cAuto: from.feasibility.b2cAuto,
+            b2cNote: from.feasibility.b2cNote,
+          }
+        : report.feasibility,
   };
 }
 
@@ -357,42 +375,28 @@ function B2BYearCard({
   );
 }
 
-function ListingCell({
-  label,
-  slice,
-  onManual,
-}: {
+type ListingCellProps = {
   label: string;
   slice: {
     searchUrl: string;
     listing: MarketListing | null;
     note?: string;
   };
+  /** Shown while this cell's request is still running. */
+  loadingNote?: string | null;
   onManual: (listing: MarketListing | null) => void;
-}) {
+};
+
+function ListingCell(props: ListingCellProps) {
   return (
     <ListingCellInner
-      key={`${label}-${slice.listing?.id ?? "empty"}-${slice.listing?.price ?? ""}`}
-      label={label}
-      slice={slice}
-      onManual={onManual}
+      key={`${props.label}-${props.slice.listing?.id ?? "empty"}-${props.slice.listing?.price ?? ""}`}
+      {...props}
     />
   );
 }
 
-function ListingCellInner({
-  label,
-  slice,
-  onManual,
-}: {
-  label: string;
-  slice: {
-    searchUrl: string;
-    listing: MarketListing | null;
-    note?: string;
-  };
-  onManual: (listing: MarketListing | null) => void;
-}) {
+function ListingCellInner({ label, slice, loadingNote, onManual }: ListingCellProps) {
   const [price, setPrice] = useState(
     slice.listing ? String(slice.listing.price) : "",
   );
@@ -412,7 +416,11 @@ function ListingCellInner({
         </a>
       </div>
       <p className="text-lg font-semibold tabular-nums tracking-tight text-ink">
-        {money(slice.listing)}
+        {loadingNote && !slice.listing ? (
+          <Loader2 className="size-4 animate-spin text-ink/50" />
+        ) : (
+          money(slice.listing)
+        )}
       </p>
       {slice.listing?.year ? (
         <p className="text-xs font-medium text-teal-900">
@@ -425,7 +433,9 @@ function ListingCellInner({
           {slice.listing.title}
         </p>
       ) : null}
-      {slice.note ? (
+      {loadingNote && !slice.listing ? (
+        <p className="text-xs text-teal-900/80">{loadingNote}</p>
+      ) : slice.note ? (
         <p className="text-xs text-teal-900/80">{slice.note}</p>
       ) : null}
       <div className="flex flex-wrap gap-2 pt-1">
@@ -483,7 +493,8 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
   const history = useMemo(() => parseHistory(historyRaw), [historyRaw]);
   const [b2bPending, setB2bPending] = useState(false);
   const [b2cPending, setB2cPending] = useState(false);
-  const pending = b2bPending || b2cPending;
+  const [uaePending, setUaePending] = useState(false);
+  const pending = b2bPending || b2cPending || uaePending;
   const [tab, setTab] = useState<string>(initial.tab);
   const autoRan = useRef(false);
   const runId = useRef(0);
@@ -544,6 +555,7 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
     setReport(null);
     setB2bPending(withDealers);
     setB2cPending(true);
+    setUaePending(true);
 
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 65_000);
@@ -556,10 +568,10 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
     const errors: string[] = [];
     let recorded = false;
 
-    // Dealer quotes (~5s) and Chrono24 (slower) load as separate requests;
-    // results show as soon as either half lands.
+    // Dealer quotes, Chrono24 prices and the UAE lookup (it opens listings,
+    // so it's the slowest) load as separate requests; each shows as it lands.
     async function load(
-      part: "b2b" | "b2c",
+      part: "b2b" | "prices" | "uae",
       body: Record<string, unknown>,
       done: (value: boolean) => void,
     ) {
@@ -569,14 +581,15 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
         setReport((prev) =>
           part === "b2b"
             ? withB2BFrom(prev ?? partReport, partReport)
-            : withB2CFrom(prev ?? partReport, partReport),
+            : withChrono24From(prev ?? partReport, partReport, part),
         );
         if (!recorded) {
           recorded = true;
           pushHistory(partReport.reference, partReport.year, partReport.month);
         }
       } catch (e) {
-        const label = part === "b2b" ? "Dealer quotes" : "Chrono24";
+        const label =
+          part === "b2b" ? "Dealer quotes" : part === "prices" ? "Chrono24" : "Chrono24 UAE";
         errors.push(
           e instanceof DOMException && e.name === "AbortError"
             ? `${label} timed out after 65s.`
@@ -592,9 +605,14 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
         ? load("b2b", { ...base, autoFetchB2C: false }, setB2bPending)
         : null,
       load(
-        "b2c",
-        { ...base, reefApiKey: reefKey || undefined, autoFetchB2B: false },
+        "prices",
+        { ...base, reefApiKey: reefKey || undefined, autoFetchB2B: false, chrono24: "prices" },
         setB2cPending,
+      ),
+      load(
+        "uae",
+        { ...base, reefApiKey: reefKey || undefined, autoFetchB2B: false, chrono24: "uae" },
+        setUaePending,
       ),
     ]);
     window.clearTimeout(timer);
@@ -874,7 +892,9 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                 </TabsTrigger>
                 <TabsTrigger value="b2c">
                   B2C · Chrono24
-                  {b2cPending ? <Loader2 className="size-3 animate-spin" /> : null}
+                  {b2cPending || uaePending ? (
+                    <Loader2 className="size-3 animate-spin" />
+                  ) : null}
                 </TabsTrigger>
                 <TabsTrigger value="report">Report</TabsTrigger>
               </TabsList>
@@ -965,6 +985,11 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                         <ListingCell
                           label="Lowest UAE"
                           slice={bucket.lowestUae}
+                          loadingNote={
+                            uaePending && report.feasibility.b2cAuto
+                              ? "Checking UAE sellers…"
+                              : null
+                          }
                           onManual={(listing) =>
                             updateB2c(y, "lowestUae", listing)
                           }

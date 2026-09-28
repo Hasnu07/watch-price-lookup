@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseChrono24Year, sanitizeApiError } from "./chrono24";
+import { parseChrono24Year, sanitizeApiError, yearPricesFromSearch } from "./chrono24";
 import { parseTimeDealerItems } from "./timedealer";
 import {
   buildEmptyReport,
@@ -126,6 +126,48 @@ describe("sanitizeApiError", () => {
     );
     assert.match(msg, /timed out/i);
     assert.doesNotMatch(msg, /DOCTYPE/);
+  });
+});
+
+describe("yearPricesFromSearch", () => {
+  // Live "7010/1G 2026" search, 2026-09-28: same 12 listings as Chrono24's year filter.
+  const listing = (price: number) => ({
+    id: String(price),
+    title: "Patek Philippe Nautilus 7010/1G",
+    price,
+    currency: "USD",
+    url: "https://www.chrono24.com/",
+  });
+  const prices = [101_000, 102_087, 102_646, 103_263, 106_922, 107_794, 109_394, 127_400];
+  const ok = (ps: number[], total: number | null = 12) => ({
+    listings: ps.map(listing),
+    total,
+  });
+  const blocked = {
+    listings: [],
+    total: null,
+    error: "Chrono24 did not serve the page (status 403)",
+  };
+
+  it("takes the lowest from the cheapest-first search and the highest from the priciest-first", () => {
+    const r = yearPricesFromSearch(ok(prices), ok([...prices].reverse()));
+    assert.equal(r.lowest?.price, 101_000);
+    assert.equal(r.highest?.price, 127_400);
+    assert.equal(r.total, 12);
+    assert.equal(r.error, undefined);
+  });
+
+  it("still gets the lowest when the cheapest-first search is blocked but the other holds every result", () => {
+    const r = yearPricesFromSearch(blocked, ok([...prices].reverse(), prices.length));
+    assert.equal(r.lowest?.price, 101_000);
+    assert.equal(r.error, undefined);
+  });
+
+  it("says so when the cheapest-first search is blocked and the other page is partial", () => {
+    const r = yearPricesFromSearch(blocked, ok([127_400, 110_000], 80));
+    assert.equal(r.lowest, null);
+    assert.equal(r.highest?.price, 127_400);
+    assert.match(r.error ?? "", /cheapest-first search/);
   });
 });
 

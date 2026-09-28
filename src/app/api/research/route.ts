@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server";
-import { fetchChrono24VerifiedByYears, type Chrono24Debug } from "@/lib/chrono24";
+import {
+  fetchChrono24ByYears,
+  type Chrono24Debug,
+  type Chrono24Mode,
+} from "@/lib/chrono24";
 import { fetchTimeDealerQuotes } from "@/lib/timedealer";
 import {
   buildEmptyReport,
@@ -17,6 +21,8 @@ type Body = ResearchInput & {
   reefApiKey?: string;
   autoFetchB2C?: boolean;
   autoFetchB2B?: boolean;
+  /** Which Chrono24 half to fetch: the page asks for "prices" and "uae" separately. */
+  chrono24?: Chrono24Mode;
   /** Include what ReefAPI returned (searches, listing years/countries). */
   debug?: boolean;
 };
@@ -64,48 +70,33 @@ async function fillB2C(
   report: ResearchReport,
   apiKey: string,
   deadline: number,
+  mode: Chrono24Mode,
   debug: boolean,
 ): Promise<void> {
   const trace: Chrono24Debug | undefined = debug ? {} : undefined;
-  const verified = await fetchChrono24VerifiedByYears({
+  const market = await fetchChrono24ByYears({
     apiKey,
     query: report.reference,
     years: report.yearPlan.yearsToCheck,
+    mode,
     deadline,
     debug: trace,
   });
   if (trace) report.debug = { chrono24: trace };
 
-  if (verified.error) {
-    report.feasibility.b2cNote = `B2C: ${verified.error}`;
-  }
-
   for (const y of report.yearPlan.yearsToCheck) {
     const bucket = report.b2c.byYear[y];
-    const slice = verified.byYear[y];
+    const slice = market.byYear[y];
     if (!bucket || !slice) continue;
-
-    bucket.lowestWorld.listing = slice.lowestWorld;
-    bucket.highestWorld.listing = slice.highestWorld;
-    bucket.lowestUae.listing = slice.lowestUae;
-
-    const yearNote =
-      slice.note ||
-      (slice.verifiedCount
-        ? `Verified ${slice.verifiedCount} Chrono24 listing(s) for year ${y}.`
-        : undefined);
-    if (yearNote) {
-      bucket.lowestWorld.note = yearNote;
-      bucket.highestWorld.note = yearNote;
+    if (mode !== "uae") {
+      bucket.lowestWorld.listing = slice.lowestWorld;
+      bucket.highestWorld.listing = slice.highestWorld;
+      bucket.lowestWorld.note = slice.note;
+      bucket.highestWorld.note = slice.note;
     }
-    if (!slice.lowestUae) {
-      bucket.lowestUae.note =
-        slice.verifiedCount > 0
-          ? `No UAE seller found among year-${y} verified listings — open the UAE Chrono24 link to confirm.`
-          : yearNote ||
-            `No year-${y} listings verified — open the Chrono24 year filter link.`;
-    } else {
-      bucket.lowestUae.note = `UAE seller · year ${slice.lowestUae.year || y}`;
+    if (mode !== "prices") {
+      bucket.lowestUae.listing = slice.lowestUae;
+      bucket.lowestUae.note = slice.uaeNote;
     }
   }
 }
@@ -173,7 +164,7 @@ export async function POST(req: Request) {
       ? "B2B: Skipped for this run (dealer feed available)."
       : "B2B: Add TIMEDEALER_PHONE + TIMEDEALER_PASSWORD in .env.local for dealer quotes.";
   report.feasibility.b2cNote = shouldFetchB2C
-    ? "B2C: Chrono24 listing prices (before shipping), year-verified via details. Compare to the Chrono24 card price — not + shipping."
+    ? "B2C: Chrono24 listing prices (before shipping) from Chrono24's year search — the same list as the Open Chrono24 links. Lowest UAE is found by opening the cheapest listings."
     : "B2C: Add a ReefAPI key in Settings (or REEF_API_KEY in .env) for auto prices.";
 
   if (!shouldFetchB2B) {
@@ -185,7 +176,13 @@ export async function POST(req: Request) {
   await Promise.all([
     shouldFetchB2B ? fillB2B(report, deadline) : Promise.resolve(),
     shouldFetchB2C
-      ? fillB2C(report, apiKey, deadline, body.debug === true)
+      ? fillB2C(
+          report,
+          apiKey,
+          deadline,
+          body.chrono24 === "prices" || body.chrono24 === "uae" ? body.chrono24 : "all",
+          body.debug === true,
+        )
       : Promise.resolve(),
   ]);
 
