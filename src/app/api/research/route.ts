@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { fetchChrono24VerifiedByYears } from "@/lib/chrono24";
+import { fetchChrono24VerifiedByYears, type Chrono24Debug } from "@/lib/chrono24";
 import { fetchTimeDealerQuotes } from "@/lib/timedealer";
 import {
   buildEmptyReport,
@@ -17,6 +17,8 @@ type Body = ResearchInput & {
   reefApiKey?: string;
   autoFetchB2C?: boolean;
   autoFetchB2B?: boolean;
+  /** Include what ReefAPI returned (searches, listing years/countries). */
+  debug?: boolean;
 };
 
 async function fillB2B(report: ResearchReport, deadline: number): Promise<void> {
@@ -62,13 +64,17 @@ async function fillB2C(
   report: ResearchReport,
   apiKey: string,
   deadline: number,
+  debug: boolean,
 ): Promise<void> {
+  const trace: Chrono24Debug | undefined = debug ? {} : undefined;
   const verified = await fetchChrono24VerifiedByYears({
     apiKey,
     query: report.reference,
     years: report.yearPlan.yearsToCheck,
     deadline,
+    debug: trace,
   });
+  if (trace) report.debug = { chrono24: trace };
 
   if (verified.error) {
     report.feasibility.b2cNote = `B2C: ${verified.error}`;
@@ -178,7 +184,9 @@ export async function POST(req: Request) {
   // Run dealer + Chrono24 in parallel so one slow provider doesn't block the other.
   await Promise.all([
     shouldFetchB2B ? fillB2B(report, deadline) : Promise.resolve(),
-    shouldFetchB2C ? fillB2C(report, apiKey, deadline) : Promise.resolve(),
+    shouldFetchB2C
+      ? fillB2C(report, apiKey, deadline, body.debug === true)
+      : Promise.resolve(),
   ]);
 
   return NextResponse.json({ report });

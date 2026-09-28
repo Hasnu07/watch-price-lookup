@@ -10,6 +10,8 @@ const MAX_WAVES = 2;
 const DETAIL_TTL_MS = 6 * 60 * 60 * 1000;
 const YEAR_TTL_MS = 20 * 60 * 1000;
 const MAX_CACHED_DETAILS = 2_000;
+/** Listings per search recorded in debug output. */
+const DEBUG_TOP = 20;
 
 type ReefSearchResponse = {
   ok?: boolean;
@@ -26,7 +28,7 @@ type ReefSearchResponse = {
     aggregate?: {
       currency?: string;
     };
-  };
+  } & Record<string, unknown>;
   error?: { message?: string } | string | null;
 };
 
@@ -56,7 +58,11 @@ export type Chrono24FetchResult = {
   currency: string;
   source: "reefapi" | "manual";
   error?: string;
+  /** Search response minus the listings (debug only). */
+  meta?: string;
 };
+
+type DetailResult = { listing: MarketListing | null; failure?: string };
 
 type YearMarket = {
   lowestWorld: MarketListing | null;
@@ -70,6 +76,30 @@ export type VerifiedChrono24Market = {
   byYear: Record<number, YearMarket>;
   error?: string;
 };
+
+/** What ReefAPI returned for each year, for `debug: true` research runs. */
+export type Chrono24Debug = Record<
+  number,
+  {
+    searches: Record<
+      string,
+      {
+        error?: string;
+        count: number;
+        meta?: string;
+        top: { id: string; price: number; title: string }[];
+      }
+    >;
+    details: {
+      id: string;
+      from: string;
+      price?: number;
+      year?: string;
+      location?: string;
+      failure?: string;
+    }[];
+  }
+>;
 
 /** Never dump HTML / Cloudflare pages into the UI. */
 export function sanitizeApiError(status: number, body: string): string {
@@ -99,6 +129,8 @@ async function reefSearch(opts: {
   query: string;
   sort: "price_asc" | "price_desc" | "relevance";
   deadline: number;
+  /** ReefAPI's year-of-production filter. */
+  year?: number;
   attempts?: number;
 }): Promise<Chrono24FetchResult> {
   const attempts = opts.attempts ?? 3;
@@ -124,6 +156,7 @@ async function reefSearch(opts: {
             query: opts.query,
             sort: opts.sort,
             page: 1,
+            ...(opts.year ? { year: opts.year } : {}),
           }),
         },
         budget,
@@ -168,7 +201,14 @@ async function reefSearch(opts: {
           image: l.image,
         }));
 
-      return { listings, currency, source: "reefapi" };
+      const { listings: _listings, ...meta } = json.data ?? {};
+      void _listings;
+      return {
+        listings,
+        currency,
+        source: "reefapi",
+        meta: JSON.stringify(meta).slice(0, 600),
+      };
     } catch (e) {
       lastError =
         isAbortError(e)
@@ -192,9 +232,9 @@ async function reefDetail(
   apiKey: string,
   listingId: string,
   deadline: number,
-): Promise<MarketListing | null> {
+): Promise<DetailResult> {
   const budget = Math.min(12_000, timeLeft(deadline) - 300);
-  if (budget < 1_500) return null;
+  if (budget < 1_500) return { listing: null, failure: "out of time" };
   try {
     const res = await fetchWithTimeout(
       "https://api.reefapi.com/chrono24/v1/detail",
@@ -209,24 +249,28 @@ async function reefDetail(
       },
       budget,
     );
-    if (!res.ok) return null;
+    if (!res.ok) return { listing: null, failure: `HTTP ${res.status}` };
     const json = (await res.json()) as ReefDetailResponse;
     const watch = json.data?.watch;
-    if (!watch || typeof watch.price !== "number" || watch.price <= 0) return null;
+    if (!watch || typeof watch.price !== "number" || watch.price <= 0) {
+      return { listing: null, failure: "no price in detail" };
+    }
     return {
-      id: String(watch.listing_id ?? listingId),
-      title: watch.title ?? listingId,
-      price: Number(watch.price),
-      currency: watch.currency || "USD",
-      url:
-        watch.url ??
-        `https://www.chrono24.com/search/index.htm?query=${encodeURIComponent(listingId)}`,
-      image: watch.image,
-      year: watch.year ?? undefined,
-      location: watch.seller_location?.addressCountry || undefined,
+      listing: {
+        id: String(watch.listing_id ?? listingId),
+        title: watch.title ?? listingId,
+        price: Number(watch.price),
+        currency: watch.currency || "USD",
+        url:
+          watch.url ??
+          `https://www.chrono24.com/search/index.htm?query=${encodeURIComponent(listingId)}`,
+        image: watch.image,
+        year: watch.year ?? undefined,
+        location: watch.seller_location?.addressCountry || undefined,
+      },
     };
-  } catch {
-    return null;
+  } catch (e) {
+    return { listing: null, failure: isAbortError(e) ? "timed out" : "network error" };
   }
 }
 
@@ -265,30 +309,41 @@ function isUae(listing: MarketListing): boolean {
  * across both comparison years, whose searches overlap). In-flight lookups
  * are shared too; failed ones are dropped so they can be retried.
  */
-const detailCache = new Map<string, { at: number; listing: Promise<MarketListing | null> }>();
+const detailCache = new Map<string, { at: number; result: Promise<DetailResult> }>();
 
 function cachedDetail(
   apiKey: string,
   listingId: string,
   deadline: number,
-): Promise<MarketListing | null> {
+): Promise<DetailResult> {
   const hit = detailCache.get(listingId);
-  if (hit && Date.now() - hit.at < DETAIL_TTL_MS) return hit.listing;
-  const listing = reefDetail(apiKey, listingId, deadline);
-  detailCache.set(listingId, { at: Date.now(), listing });
-  void listing.then((d) => {
-    if (!d) detailCache.delete(listingId);
+  if (hit && Date.now() - hit.at < DETAIL_TTL_MS) return hit.result;
+  const result = reefDetail(apiKey, listingId, deadline);
+  detailCache.set(listingId, { at: Date.now(), result });
+  void result.then((d) => {
+    if (!d.listing) detailCache.delete(listingId);
   });
   // Maps iterate in insertion order: drop the oldest entries first.
   for (const key of detailCache.keys()) {
     if (detailCache.size <= MAX_CACHED_DETAILS) break;
     detailCache.delete(key);
   }
-  return listing;
+  return result;
 }
 
 /** Finished year results, so re-running the same watch is instant. */
 const yearCache = new Map<string, { at: number; market: YearMarket }>();
+
+function debugSearch(result: Chrono24FetchResult) {
+  return {
+    error: result.error,
+    count: result.listings.length,
+    meta: result.meta,
+    top: result.listings
+      .slice(0, DEBUG_TOP)
+      .map((l) => ({ id: l.id, price: l.price, title: l.title.slice(0, 80) })),
+  };
+}
 
 /**
  * ReefAPI's `year` filter is ignored, but appending the year to the query
@@ -298,6 +353,9 @@ const yearCache = new Map<string, { at: number; market: YearMarket }>();
  * Speed: both searches run together, then listings are opened in parallel
  * waves from the cheap and pricey ends at once, stopping as soon as each end
  * has a year-verified match. Lowest UAE comes from listings already opened.
+ *
+ * With `debug`, the cache is bypassed, the `year` filter is probed with an
+ * extra search, and everything ReefAPI returned is recorded into it.
  */
 export async function fetchChrono24VerifiedByYears(opts: {
   apiKey: string;
@@ -305,26 +363,45 @@ export async function fetchChrono24VerifiedByYears(opts: {
   years: number[];
   /** Epoch ms by which we must return, with whatever was verified so far. */
   deadline: number;
+  debug?: Chrono24Debug;
 }): Promise<VerifiedChrono24Market> {
-  const { apiKey, deadline } = opts;
+  const { apiKey, deadline, debug } = opts;
   const years = [...new Set(opts.years)].sort();
 
   async function verifyYear(y: number): Promise<YearMarket> {
     const cacheKey = `${opts.query.toUpperCase()}|${y}`;
     const cached = yearCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < YEAR_TTL_MS) {
+    if (!debug && cached && Date.now() - cached.at < YEAR_TTL_MS) {
       const minutes = Math.max(1, Math.round((Date.now() - cached.at) / 60_000));
       return {
         ...cached.market,
         note: `${cached.market.note ?? ""} From a check ${minutes} min ago.`.trim(),
       };
     }
+    let trace: Chrono24Debug[number] | null = null;
+    if (debug) {
+      trace = { searches: {}, details: [] };
+      debug[y] = trace;
+    }
 
     const yearQuery = `${opts.query} ${y}`;
-    const [asc, desc] = await Promise.all([
+    const [asc, desc, yearParamAsc, yearParamDesc] = await Promise.all([
       reefSearch({ apiKey, query: yearQuery, sort: "price_asc", deadline, attempts: 2 }),
       reefSearch({ apiKey, query: yearQuery, sort: "price_desc", deadline, attempts: 2 }),
+      trace
+        ? reefSearch({ apiKey, query: opts.query, year: y, sort: "price_asc", deadline, attempts: 1 })
+        : null,
+      trace
+        ? reefSearch({ apiKey, query: opts.query, year: y, sort: "price_desc", deadline, attempts: 1 })
+        : null,
     ]);
+    if (trace) {
+      trace.searches.textAsc = debugSearch(asc);
+      trace.searches.textDesc = debugSearch(desc);
+      if (yearParamAsc) trace.searches.yearParamAsc = debugSearch(yearParamAsc);
+      if (yearParamDesc) trace.searches.yearParamDesc = debugSearch(yearParamDesc);
+    }
+
     const empty: YearMarket = {
       lowestWorld: null,
       highestWorld: null,
@@ -334,12 +411,36 @@ export async function fetchChrono24VerifiedByYears(opts: {
     if (asc.error && desc.error) return { ...empty, note: asc.error || desc.error };
 
     let outOfTime = false;
+    const failures: string[] = [];
     const cheapEndDetails: MarketListing[] = [];
     const allDetails = new Map<string, MarketListing>();
+
+    async function openListings(
+      listings: MarketListing[],
+      from: string,
+    ): Promise<(MarketListing | null)[]> {
+      const results = await Promise.all(
+        listings.map((l) => cachedDetail(apiKey, l.id, deadline)),
+      );
+      return results.map((r, i) => {
+        if (r.failure) failures.push(r.failure);
+        trace?.details.push({
+          id: listings[i]!.id,
+          from,
+          price: r.listing?.price ?? listings[i]!.price,
+          year: r.listing?.year,
+          location: r.listing?.location,
+          failure: r.failure,
+        });
+        if (r.listing) allDetails.set(r.listing.id, r.listing);
+        return r.listing;
+      });
+    }
 
     async function firstMatch(
       listings: MarketListing[],
       opened: MarketListing[],
+      from: string,
     ): Promise<MarketListing | null> {
       for (let wave = 0; wave < MAX_WAVES; wave++) {
         const batch = listings.slice(wave * DETAIL_WAVE, (wave + 1) * DETAIL_WAVE);
@@ -348,14 +449,8 @@ export async function fetchChrono24VerifiedByYears(opts: {
           outOfTime = true;
           break;
         }
-        const details = await Promise.all(
-          batch.map((l) => cachedDetail(apiKey, l.id, deadline)),
-        );
-        for (const d of details) {
-          if (!d) continue;
-          opened.push(d);
-          allDetails.set(d.id, d);
-        }
+        const details = await openListings(batch, from);
+        for (const d of details) if (d) opened.push(d);
         // Keep search order: the first exact-year hit is the cheapest/priciest.
         const exact = details.find((d) => d && matchesExactYear(d, y, false));
         if (exact) return exact;
@@ -364,8 +459,10 @@ export async function fetchChrono24VerifiedByYears(opts: {
     }
 
     const [lowestWorld, highestWorld] = await Promise.all([
-      firstMatch(asc.listings, cheapEndDetails),
-      firstMatch(desc.listings, []),
+      firstMatch(asc.listings, cheapEndDetails, "textAsc"),
+      firstMatch(desc.listings, [], "textDesc"),
+      // Debug: check whether the year filter's cheapest results are that year.
+      yearParamAsc ? openListings(yearParamAsc.listings.slice(0, 8), "yearParamAsc") : null,
     ]);
     const lowestUae =
       cheapEndDetails
@@ -375,18 +472,23 @@ export async function fetchChrono24VerifiedByYears(opts: {
       matchesExactYear(d, y, true),
     ).length;
 
+    const failureNote = failures.length
+      ? ` ${failures.length} listing check${failures.length === 1 ? "" : "s"} failed (${[...new Set(failures)].join(", ")}) — some prices may be missing.`
+      : "";
     const market: YearMarket = {
       lowestWorld,
       highestWorld,
       lowestUae,
       verifiedCount,
-      note: outOfTime
-        ? OUT_OF_TIME
-        : !lowestWorld && !highestWorld
-          ? `No Chrono24 listings verified for year ${y}. Use the year-filtered Chrono24 link.`
-          : `Year ${y} search verified via Chrono24 details. Listing price before shipping.`,
+      note:
+        (outOfTime
+          ? OUT_OF_TIME
+          : !lowestWorld && !highestWorld
+            ? `No Chrono24 listings verified for year ${y}. Use the year-filtered Chrono24 link.`
+            : `Year ${y} search verified via Chrono24 details. Listing price before shipping.`) +
+        failureNote,
     };
-    if (!outOfTime && !asc.error && !desc.error) {
+    if (!outOfTime && !failures.length && !asc.error && !desc.error) {
       yearCache.set(cacheKey, { at: Date.now(), market });
     }
     return market;

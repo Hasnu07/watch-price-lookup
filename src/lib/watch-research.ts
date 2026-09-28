@@ -76,6 +76,8 @@ export type ResearchReport = {
   year: number;
   month: number | null;
   generatedAt: string;
+  /** Provider diagnostics, only when the request asks for `debug`. */
+  debug?: Record<string, unknown>;
   yearPlan: YearPlan;
   b2b: B2BYear[];
   b2c: {
