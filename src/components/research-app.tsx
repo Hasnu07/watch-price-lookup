@@ -27,13 +27,28 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { BuyPanel, SellPanel, type DealForm } from "@/components/deal-calculator";
+import {
+  analyzeBuy,
+  analyzeSell,
+  dealReportLines,
+  convertTyped,
+  fromUsd,
+  marketLevels,
+  parseAmount,
+  parsePercent,
+  toUsd,
+} from "@/lib/deal";
+import type { DeepLink } from "@/lib/deep-link";
 import { useLocalStorage } from "@/lib/use-local-storage";
 import {
+  MAX_YEAR_SPAN,
   MONTH_NAMES,
   formatMoney,
   formatReportText,
   releaseMonth,
   sortQuotes,
+  yearsLabel,
   type B2BQuote,
   type B2BYear,
   type MarketListing,
@@ -43,23 +58,28 @@ import { cn } from "@/lib/utils";
 
 const STORAGE_KEY = "watch-price-research:reef-key";
 const HISTORY_KEY = "watch-price-research:history";
+const COSTS_KEY = "watch-price-research:costs-pct";
+const PROFIT_KEY = "watch-price-research:profit-pct";
+const DEFAULT_COSTS_PCT = 2;
+const DEFAULT_PROFIT_PCT = 5;
 
-export type DeepLink = {
-  reference: string;
-  year: string;
-  month: string;
-  dial: string;
-  tab: "b2b" | "b2c" | "report";
-  autorun: boolean;
-  skipB2B: boolean;
-};
 
 type HistoryEntry = {
   reference: string;
-  year: number;
+  yearFrom?: number;
+  yearTo?: number;
+  /** Entries saved before year ranges. */
+  year?: number;
   month?: number | null;
   at: string;
 };
+
+function historyRange(h: HistoryEntry): { from: number; to: number } {
+  return {
+    from: h.yearFrom ?? h.year ?? new Date().getFullYear(),
+    to: h.yearTo ?? h.year ?? new Date().getFullYear(),
+  };
+}
 
 function parseHistory(raw: string | null): HistoryEntry[] {
   if (!raw) return [];
@@ -131,7 +151,12 @@ function withChrono24From(
     const current = byYear[Number(y)] ?? slices;
     byYear[Number(y)] =
       part === "prices"
-        ? { ...current, lowestWorld: slices.lowestWorld, highestWorld: slices.highestWorld }
+        ? {
+            ...current,
+            lowestWorld: slices.lowestWorld,
+            highestWorld: slices.highestWorld,
+            retail: slices.retail,
+          }
         : { ...current, lowestUae: slices.lowestUae };
   }
   return {
@@ -480,7 +505,8 @@ function ListingCellInner({ label, slice, loadingNote, onManual }: ListingCellPr
 
 export function ResearchApp({ initial }: { initial: DeepLink }) {
   const [reference, setReference] = useState(initial.reference);
-  const [year, setYear] = useState(initial.year);
+  const [yearFrom, setYearFrom] = useState(initial.yearFrom);
+  const [yearTo, setYearTo] = useState(initial.yearTo);
   const [month, setMonth] = useState(initial.month);
   const [dial, setDial] = useState(initial.dial);
   const [storedReefKey, setStoredReefKey] = useLocalStorage(STORAGE_KEY);
@@ -499,19 +525,90 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
   const autoRan = useRef(false);
   const runId = useRef(0);
 
-  const yearNum = Number(year);
+  const fromNum = Number(yearFrom);
+  const toNum = Number(yearTo);
+  const rangeError =
+    !fromNum || !toNum
+      ? "Enter both years."
+      : fromNum > toNum
+        ? "\"Year from\" must not be after \"Year to\"."
+        : toNum - fromNum + 1 > MAX_YEAR_SPAN
+          ? `Pick at most ${MAX_YEAR_SPAN} years at once.`
+          : null;
 
-  const reportText = useMemo(
-    () => (report ? formatReportText(report) : ""),
-    [report],
+  // Buy / Sell calculator: inputs live here so the report can include them.
+  const [deal, setDeal] = useState<DealForm>({
+    currency: "USD",
+    asking: "",
+    client: "",
+    offer: "",
+    cost: "",
+  });
+  const [costsRaw, setCostsRaw] = useLocalStorage(COSTS_KEY);
+  const [profitRaw, setProfitRaw] = useLocalStorage(PROFIT_KEY);
+  const costsInput = costsRaw ?? String(DEFAULT_COSTS_PCT);
+  const profitInput = profitRaw ?? String(DEFAULT_PROFIT_PCT);
+  const settings = useMemo(
+    () => ({
+      costsPct: parsePercent(costsInput, DEFAULT_COSTS_PCT),
+      profitPct: parsePercent(profitInput, DEFAULT_PROFIT_PCT),
+    }),
+    [costsInput, profitInput],
   );
+  function updateDeal(patch: Partial<DealForm>) {
+    setDeal((d) => {
+      const to = patch.currency;
+      if (!to || to === d.currency) return { ...d, ...patch };
+      // Typed amounts keep their meaning when the currency changes.
+      return {
+        ...d,
+        currency: to,
+        asking: convertTyped(d.asking, d.currency, to),
+        client: convertTyped(d.client, d.currency, to),
+        offer: convertTyped(d.offer, d.currency, to),
+        cost: convertTyped(d.cost, d.currency, to),
+      };
+    });
+  }
+  const dealUsd = (raw: string) => {
+    const amount = parseAmount(raw);
+    return amount === null ? null : toUsd(amount, deal.currency);
+  };
+  const askingUsd = dealUsd(deal.asking);
+  const clientUsd = dealUsd(deal.client);
+  const offerUsd = dealUsd(deal.offer);
+  const costUsd = dealUsd(deal.cost);
+  const fmtDeal = (usd: number) => formatMoney(fromUsd(usd, deal.currency), deal.currency);
 
-  function pushHistory(ref: string, y: number, m: number | null) {
+  const market = useMemo(() => (report ? marketLevels(report) : null), [report]);
+  const buy = market
+    ? analyzeBuy({ askingUsd, clientUsd, market, settings, fmt: fmtDeal })
+    : null;
+  const sell = market
+    ? analyzeSell({ offerUsd, costUsd, market, settings, fmt: fmtDeal })
+    : null;
+
+  const reportText =
+    report && market && buy && sell
+      ? formatReportText(
+          report,
+          dealReportLines({
+            market,
+            currency: deal.currency,
+            settings,
+            buy: { askingUsd, analysis: buy },
+            sell: { offerUsd, analysis: sell },
+          }),
+        )
+      : "";
+
+  function pushHistory(ref: string, from: number, to: number, m: number | null) {
     const next: HistoryEntry[] = [
-      { reference: ref, year: y, month: m, at: new Date().toISOString() },
-      ...history.filter(
-        (h) => !(h.reference === ref && h.year === y && (h.month ?? null) === m),
-      ),
+      { reference: ref, yearFrom: from, yearTo: to, month: m, at: new Date().toISOString() },
+      ...history.filter((h) => {
+        const r = historyRange(h);
+        return !(h.reference === ref && r.from === from && r.to === to && (h.month ?? null) === m);
+      }),
     ].slice(0, 12);
     setHistoryRaw(JSON.stringify(next));
   }
@@ -547,6 +644,10 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
       setError("Reference is required.");
       return;
     }
+    if (rangeError) {
+      setError(rangeError);
+      return;
+    }
     const id = ++runId.current;
     const isCurrent = () => runId.current === id;
     const withDealers = !opts?.skipB2B;
@@ -561,7 +662,8 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
     const timer = window.setTimeout(() => controller.abort(), 65_000);
     const base = {
       reference: ref,
-      year: yearNum,
+      yearFrom: fromNum,
+      yearTo: toNum,
       month: month ? Number(month) : null,
       dial: dial || undefined,
     };
@@ -585,7 +687,12 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
         );
         if (!recorded) {
           recorded = true;
-          pushHistory(partReport.reference, partReport.year, partReport.month);
+          pushHistory(
+            partReport.reference,
+            partReport.yearFrom,
+            partReport.yearTo,
+            partReport.month,
+          );
         }
       } catch (e) {
         const label =
@@ -662,9 +769,9 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
               Watch Price Check
             </h1>
             <p className="max-w-xl text-sm leading-relaxed text-ink/70 sm:text-base">
-              Enter the full reference and year. The app applies your B2B / B2C
-              checklist, opens the right market searches, and builds the report
-              format — one watch at a time.
+              Enter the full reference and a year range. The app pulls dealer
+              (TimeDealer) and retail (Chrono24) prices, then tells you what a
+              watch is worth buying or selling at after your costs and profit.
             </p>
           </div>
           <Button
@@ -729,7 +836,7 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                 void runResearch();
               }}
             >
-              <div className="space-y-2 lg:col-span-5">
+              <div className="space-y-2 lg:col-span-4">
                 <Label htmlFor="ref">Reference</Label>
                 <Input
                   id="ref"
@@ -741,14 +848,27 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                 />
               </div>
               <div className="space-y-2 lg:col-span-2">
-                <Label htmlFor="year">Year</Label>
+                <Label htmlFor="year-from">Year from</Label>
                 <Input
-                  id="year"
+                  id="year-from"
                   type="number"
                   min={1990}
                   max={2035}
-                  value={year}
-                  onChange={(e) => setYear(e.target.value)}
+                  value={yearFrom}
+                  onChange={(e) => setYearFrom(e.target.value)}
+                  required
+                  className="h-11"
+                />
+              </div>
+              <div className="space-y-2 lg:col-span-2">
+                <Label htmlFor="year-to">Year to</Label>
+                <Input
+                  id="year-to"
+                  type="number"
+                  min={1990}
+                  max={2035}
+                  value={yearTo}
+                  onChange={(e) => setYearTo(e.target.value)}
                   required
                   className="h-11"
                 />
@@ -769,8 +889,8 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                   ))}
                 </select>
               </div>
-              <div className="space-y-2 lg:col-span-3">
-                <Label htmlFor="dial">Dial (optional override)</Label>
+              <div className="space-y-2 lg:col-span-2">
+                <Label htmlFor="dial">Dial (optional)</Label>
                 <Input
                   id="dial"
                   placeholder="Auto from suffix"
@@ -782,7 +902,7 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
               <div className="flex flex-col gap-2 lg:col-span-12 sm:flex-row sm:items-center">
                 <Button
                   type="submit"
-                  disabled={pending || !reference.trim() || !yearNum}
+                  disabled={pending || !reference.trim() || Boolean(rangeError)}
                   className="h-11 bg-ink text-white hover:bg-ink/90"
                 >
                   {pending ? (
@@ -792,6 +912,9 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                   )}
                   {pending ? "Researching…" : "Run price check"}
                 </Button>
+                {rangeError && !pending ? (
+                  <p className="text-xs text-red-700">{rangeError}</p>
+                ) : null}
                 {pending ? (
                   <p className="text-xs text-ink/60">
                     {report && !b2bPending
@@ -804,21 +927,25 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
 
             {history.length > 0 ? (
               <div className="mt-5 flex flex-wrap gap-2">
-                {history.map((h) => (
-                  <button
-                    key={`${h.reference}-${h.year}-${h.at}`}
-                    type="button"
-                    onClick={() => {
-                      setReference(h.reference);
-                      setYear(String(h.year));
-                      setMonth(h.month ? String(h.month) : "");
-                    }}
-                    className="rounded-full border border-ink/10 bg-white/60 px-3 py-1 text-xs text-ink/70 transition hover:border-teal-700/30 hover:text-ink"
-                  >
-                    {h.reference} · {h.year}
-                    {h.month ? ` ${MONTH_NAMES[h.month - 1]?.slice(0, 3)}` : ""}
-                  </button>
-                ))}
+                {history.map((h) => {
+                  const r = historyRange(h);
+                  return (
+                    <button
+                      key={`${h.reference}-${r.from}-${r.to}-${h.at}`}
+                      type="button"
+                      onClick={() => {
+                        setReference(h.reference);
+                        setYearFrom(String(r.from));
+                        setYearTo(String(r.to));
+                        setMonth(h.month ? String(h.month) : "");
+                      }}
+                      className="rounded-full border border-ink/10 bg-white/60 px-3 py-1 text-xs text-ink/70 transition hover:border-teal-700/30 hover:text-ink"
+                    >
+                      {h.reference} · {yearsLabel(r.from, r.to)}
+                      {h.month ? ` ${MONTH_NAMES[h.month - 1]?.slice(0, 3)}` : ""}
+                    </button>
+                  );
+                })}
               </div>
             ) : null}
           </CardContent>
@@ -840,10 +967,10 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                   {report.reference}
                 </p>
                 <p className="text-sm text-ink/65">
-                  Dial {report.dial} ·{" "}
+                  Dial {report.dial} · {yearsLabel(report.yearFrom, report.yearTo)}
                   {report.month
-                    ? `${MONTH_NAMES[report.month - 1]} ${report.year}`
-                    : report.year}
+                    ? ` · ${MONTH_NAMES[report.month - 1]} ${report.yearTo}`
+                    : ""}
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -885,7 +1012,9 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
             </div>
 
             <Tabs value={tab} onValueChange={setTab} className="gap-4">
-              <TabsList className="bg-white/60">
+              <TabsList className="h-auto flex-wrap bg-white/60">
+                <TabsTrigger value="buy">Buy</TabsTrigger>
+                <TabsTrigger value="sell">Sell</TabsTrigger>
                 <TabsTrigger value="b2b">
                   B2B · dealers
                   {b2bPending ? <Loader2 className="size-3 animate-spin" /> : null}
@@ -898,6 +1027,42 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                 </TabsTrigger>
                 <TabsTrigger value="report">Report</TabsTrigger>
               </TabsList>
+
+              <TabsContent value="buy">
+                {market && buy ? (
+                  <BuyPanel
+                    form={deal}
+                    onForm={updateDeal}
+                    costsPct={costsInput}
+                    profitPct={profitInput}
+                    onCostsPct={setCostsRaw}
+                    onProfitPct={setProfitRaw}
+                    market={market}
+                    years={yearsLabel(report.yearFrom, report.yearTo)}
+                    loading={pending}
+                    analysis={buy}
+                    askingUsd={askingUsd}
+                  />
+                ) : null}
+              </TabsContent>
+
+              <TabsContent value="sell">
+                {market && sell ? (
+                  <SellPanel
+                    form={deal}
+                    onForm={updateDeal}
+                    costsPct={costsInput}
+                    profitPct={profitInput}
+                    onCostsPct={setCostsRaw}
+                    onProfitPct={setProfitRaw}
+                    market={market}
+                    years={yearsLabel(report.yearFrom, report.yearTo)}
+                    loading={pending}
+                    analysis={sell}
+                    offerUsd={offerUsd}
+                  />
+                ) : null}
+              </TabsContent>
 
               <TabsContent value="b2b" className="space-y-4">
                 {b2bPending ? null : (
@@ -1030,7 +1195,7 @@ export function ResearchApp({ initial }: { initial: DeepLink }) {
                         Send-ready result
                       </CardTitle>
                       <CardDescription>
-                        Matches your team template: reference, year, B2B quotes, B2C.
+                        Matches your team template: reference, years, B2B quotes, B2C, plus market levels and any buy / sell check.
                       </CardDescription>
                     </div>
                     <Button

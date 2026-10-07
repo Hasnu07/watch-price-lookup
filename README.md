@@ -1,16 +1,27 @@
 # Watch Price Check
 
-Dealer desk app for luxury watch market research. Enter a **full reference** and **year** (month optional). The app applies your B2B / B2C checklist and builds the send-ready report.
+Dealer desk app for luxury watch buying and selling. Enter a **full reference** and a **year range** (month optional). The app pulls dealer (TimeDealer) and retail (Chrono24) prices, tells you what the watch is worth buying or selling at after your costs and profit, and builds the send-ready report.
 
 ## What it does
 
 | Step | In the app |
 | --- | --- |
 | Reference + dial | Normalizes the full reference; dial hint from the suffix (e.g. `-010`) |
-| Year rules | Relative to the current year. Current year → check it + the year before (month optional, used to flag same-month quotes). Previous two years → check those two only (no current-year comps). Older → that year + the one before |
+| Year range | "Year from" → "Year to" (up to 6 years); every year is priced separately, newest first. Month (optional) applies to the newest year and flags same-month dealer quotes |
+| Buy | Seller's asking price (+ your client's price if pre-sold) → the most you can pay for a quick dealer flip, a UAE retail sale or your client, and a verdict |
+| Sell | Client's offer (+ your cost) → quick dealer price, UAE retail price, your floor, profit, and a verdict |
 | B2B | Up to 10 TimeDealer price cards per year (last 90 days): the 9 cheapest plus the highest. Seller, phone / WhatsApp, group, dated, condition, dial, posted time, verified. Reposts are merged, price typos dropped, HKD mislabelled as USD fixed. **HKD stays HKD** |
 | B2C | Chrono24 lowest world, highest world, lowest UAE per comparison year (auto with ReefAPI, links otherwise). Lowest / highest come from Chrono24's year search (same list as the year-filtered link); lowest UAE by opening the cheapest listings |
-| Report | Copy-paste block matching your team template: lowest, #2, #3 and highest dealer quote per year |
+| Report | Copy-paste block matching your team template: lowest, #2, #3 and highest dealer quote per year, market levels, and any buy / sell check |
+
+## Buy / Sell maths
+
+Costs/commission % and target profit % are both **% of the sale price** and are remembered in the browser (defaults 2% and 5%).
+
+- **Pay at most** = resale price × (1 − costs% − profit%). Resale price is the lowest dealer price (quick flip), the lowest UAE Chrono24 listing (retail), or your client's price.
+- **Floor** (sell) = your cost ÷ (1 − costs% − profit%).
+- **Profit** = sale price × (1 − costs%) − what you paid.
+- Market levels (dealer low / median / high, retail low / median / lowest UAE) combine every year in the range. Amounts can be entered in USD, HKD or AED — both pegged to the dollar (7.80 and 3.6725) — and dealer quotes are compared using TimeDealer's own USD rate. Quote cards and report lines still show HKD as HKD.
 
 ## What is automatic?
 
@@ -20,7 +31,7 @@ Dealer desk app for luxury watch market research. Enter a **full reference** and
 
 ## Deep links
 
-`/?ref=7118/1200A-010&year=2026&month=3&tab=b2b&autorun=1` fills the form and runs the check. Add `&b2b=0` to skip TimeDealer for that run. `tab` is `b2b`, `b2c` (default) or `report`.
+`/?ref=7118/1200A-010&from=2024&to=2026&month=3&tab=sell&autorun=1` fills the form and runs the check. Add `&b2b=0` to skip TimeDealer for that run. `tab` is `buy` (default), `sell`, `b2b`, `b2c` or `report`. Old links with `&year=2026` still work (→ 2025–2026).
 
 ## Run locally
 

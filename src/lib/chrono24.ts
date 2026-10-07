@@ -1,10 +1,13 @@
+import { toUsd } from "@/lib/deal";
 import { fetchWithTimeout, isAbortError, timeLeft } from "@/lib/http";
 import type { MarketListing } from "@/lib/watch-research";
 
 const OUT_OF_TIME =
   "Stopped at the time limit — some Chrono24 prices may be missing. Use the Open Chrono24 year links.";
-/** Cheapest listings opened to find a UAE seller (search cards have no country). */
+/** Cheapest listings opened per year to find a UAE seller (search cards have no country). */
 const UAE_CHECKS = 8;
+/** Across a long year range, fewer per year so ReefAPI isn't flooded. */
+const UAE_CHECKS_TOTAL = 16;
 /** ReefAPI detail pages can take 15–20s while Chrono24 challenges them. */
 const DETAIL_TIMEOUT_MS = 25_000;
 const SEARCH_TIMEOUT_MS = 25_000;
@@ -75,6 +78,8 @@ type YearMarket = {
   highestWorld: MarketListing | null;
   lowestUae: MarketListing | null;
   total: number | null;
+  /** USD prices of the year search's listings, for market stats. */
+  sampleUsd: number[];
   note?: string;
   uaeNote?: string;
 };
@@ -373,6 +378,7 @@ export async function fetchChrono24ByYears(opts: {
 }): Promise<VerifiedChrono24Market> {
   const { apiKey, deadline, debug, mode } = opts;
   const years = [...new Set(opts.years)].sort();
+  const uaeChecks = Math.min(UAE_CHECKS, Math.max(4, Math.floor(UAE_CHECKS_TOTAL / years.length)));
 
   async function forYear(y: number): Promise<YearMarket> {
     const yearQuery = `${opts.query} ${y}`;
@@ -407,6 +413,10 @@ export async function fetchChrono24ByYears(opts: {
       highestWorld: null,
       lowestUae: null,
       total: prices.total,
+      sampleUsd: (asc.error ? desc : asc).listings
+        .map((l) => toUsd(l.price, l.currency))
+        .filter((n): n is number => n !== null)
+        .sort((a, b) => a - b),
     };
 
     if (mode !== "uae") {
@@ -431,7 +441,7 @@ export async function fetchChrono24ByYears(opts: {
     if (mode !== "prices") {
       const cheapest = (asc.error ? [...desc.listings].reverse() : asc.listings).slice(
         0,
-        UAE_CHECKS,
+        uaeChecks,
       );
       const results = await Promise.all(
         cheapest.map((l) =>

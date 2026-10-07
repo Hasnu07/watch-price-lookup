@@ -1,12 +1,15 @@
 export type ResearchInput = {
   reference: string;
-  year: number;
+  yearFrom: number;
+  yearTo: number;
   month?: number | null;
   dial?: string;
 };
 
 export type YearPlan = {
-  ourYear: number;
+  yearFrom: number;
+  yearTo: number;
+  /** Production month of our watch; applies to the newest year in the range. */
   ourMonth: number | null;
   yearsToCheck: number[];
   rules: string[];
@@ -68,12 +71,15 @@ export type B2BYear = {
   moreAvailable?: boolean;
   status: "ok" | "empty" | "error" | "skipped";
   note?: string;
+  /** USD value of every listing seen (not just the cards), for market stats. */
+  sampleUsd?: number[];
 };
 
 export type ResearchReport = {
   reference: string;
   dial: string;
-  year: number;
+  yearFrom: number;
+  yearTo: number;
   month: number | null;
   generatedAt: string;
   /** Provider diagnostics, only when the request asks for `debug`. */
@@ -87,6 +93,8 @@ export type ResearchReport = {
         lowestWorld: B2CSlice;
         highestWorld: B2CSlice;
         lowestUae: B2CSlice;
+        /** Chrono24's year search: result count and listing prices (USD). */
+        retail?: { total: number | null; sampleUsd: number[] };
       }
     >;
   };
@@ -120,6 +128,8 @@ const MONTH_NAMES = [
 
 /** Dealer quote cards per year: the cheapest ones plus the single highest. */
 export const MAX_B2B_CARDS = 10;
+/** Years in one check; each year costs TimeDealer + ReefAPI calls. */
+export const MAX_YEAR_SPAN = 6;
 /** Cheapest dealer quotes listed in the copy-paste report (plus the highest). */
 const REPORT_CHEAPEST_QUOTES = 3;
 
@@ -136,58 +146,55 @@ export function extractDialHint(reference: string): string {
 }
 
 /**
- * Comparison years are relative to the current year, so the rules keep
- * working after a year change:
- * - current year → check current + previous; month matters for freshness
- * - previous two years → check those two only (no current-year comps)
- * - older → that year and the one before
+ * Old single-year links (?year=2026) map to the team's original comparison
+ * rule: current year → it + the year before; the two years before that →
+ * those two; older → that year and the one before.
  */
-export function buildYearPlan(
+export function legacyYearRange(
   year: number,
+  currentYear: number = new Date().getFullYear(),
+): { yearFrom: number; yearTo: number } {
+  if (year === currentYear) return { yearFrom: year - 1, yearTo: year };
+  if (year === currentYear - 1 || year === currentYear - 2) {
+    return { yearFrom: currentYear - 2, yearTo: currentYear - 1 };
+  }
+  return { yearFrom: year - 1, yearTo: year };
+}
+
+export function yearsLabel(yearFrom: number, yearTo: number): string {
+  return yearFrom === yearTo ? String(yearTo) : `${yearFrom}–${yearTo}`;
+}
+
+/** Every year from `yearFrom` to `yearTo` is checked separately, newest first. */
+export function buildYearPlan(
+  yearFrom: number,
+  yearTo: number,
   month?: number | null,
   currentYear: number = new Date().getFullYear(),
 ): YearPlan {
-  const rules: string[] = [];
-  let yearsToCheck: number[];
-  const monthMatters = year === currentYear;
+  const from = Math.min(yearFrom, yearTo);
+  const to = Math.max(yearFrom, yearTo);
+  const yearsToCheck: number[] = [];
+  for (let y = to; y >= from; y--) yearsToCheck.push(y);
+  const monthMatters = to === currentYear;
   const ourMonth = month ?? null;
 
-  if (year === currentYear) {
-    yearsToCheck = [year, year - 1];
+  const rules: string[] = [
+    from === to
+      ? `Comparing ${to} pieces only.`
+      : `Comparing ${from}–${to}: each year is priced separately, newest first.`,
+  ];
+  if (monthMatters) {
     rules.push(
-      `Our watch is ${year} — search ${year} first, then also check ${year - 1} for the value gap.`,
+      ourMonth
+        ? `Month matters for fresh pieces (especially Patek, Rolex, AP). Target month: ${MONTH_NAMES[ourMonth - 1]} ${to} — Hong Kong pays more for the freshest stock.`
+        : "Month matters for fresh pieces (especially Patek, Rolex, AP) — add it when known so same-month quotes stand out.",
     );
-    if (ourMonth) {
-      rules.push(
-        "Month matters for fresh pieces (especially Patek, Rolex, AP). Prefer listings closest to our month.",
-      );
-      rules.push(
-        `Target month: ${MONTH_NAMES[ourMonth - 1]} ${year}. Hong Kong pays more for the freshest stock.`,
-      );
-    } else {
-      rules.push(
-        "Month matters for fresh pieces (especially Patek, Rolex, AP) — add it when known so same-month quotes stand out.",
-      );
-    }
-  } else if (year === currentYear - 1 || year === currentYear - 2) {
-    yearsToCheck = [currentYear - 2, currentYear - 1];
-    rules.push(
-      `Our watch is ${year} — report ${yearsToCheck.join(" and ")} only. Do not use ${currentYear} prices as a reference.`,
-    );
-  } else {
-    yearsToCheck = [year, year - 1].filter((y) => y >= 1990);
-    rules.push(
-      `Our watch is ${year} — check ${yearsToCheck.join(" and ")}. Avoid newer-year prices as comps.`,
-    );
+  } else if (to < currentYear) {
+    rules.push(`Range ends at ${to} — leave newer-year prices out as comps.`);
   }
 
-  return {
-    ourYear: year,
-    ourMonth,
-    yearsToCheck,
-    rules,
-    monthMatters,
-  };
+  return { yearFrom: from, yearTo: to, ourMonth, yearsToCheck, rules, monthMatters };
 }
 
 export function chrono24SearchUrl(opts: {
@@ -257,7 +264,7 @@ export function buildEmptyReport(
 ): ResearchReport {
   const reference = normalizeReference(input.reference);
   const dial = input.dial?.trim() || extractDialHint(reference);
-  const yearPlan = buildYearPlan(input.year, input.month, currentYear);
+  const yearPlan = buildYearPlan(input.yearFrom, input.yearTo, input.month, currentYear);
   const byYear: ResearchReport["b2c"]["byYear"] = {};
 
   for (const y of yearPlan.yearsToCheck) {
@@ -271,13 +278,14 @@ export function buildEmptyReport(
   return {
     reference,
     dial,
-    year: input.year,
+    yearFrom: yearPlan.yearFrom,
+    yearTo: yearPlan.yearTo,
     month: yearPlan.ourMonth,
     generatedAt: new Date().toISOString(),
     yearPlan,
     b2b: yearPlan.yearsToCheck.map((y) => ({
       year: y,
-      month: y === input.year ? yearPlan.ourMonth : null,
+      month: y === yearPlan.yearTo ? yearPlan.ourMonth : null,
       quotes: [],
       totalFound: 0,
       status: "skipped",
@@ -287,7 +295,7 @@ export function buildEmptyReport(
       timedealer: timedealerSearchUrl(reference),
       chrono24Base: chrono24SearchUrl({
         reference,
-        year: input.year,
+        year: yearPlan.yearTo,
         sort: "relevance",
       }),
       otherSources: otherMarketLinks(reference),
@@ -372,14 +380,16 @@ function describeQuote(quote: B2BQuote): string {
     .join(" · ");
 }
 
-export function formatReportText(report: ResearchReport): string {
+/** Send-ready text; `extra` (market levels, deal checks) goes before the checklist. */
+export function formatReportText(report: ResearchReport, extra: string[] = []): string {
+  const years = yearsLabel(report.yearFrom, report.yearTo);
   const monthLabel = report.month
-    ? `${report.year} (${MONTH_NAMES[report.month - 1]})`
-    : String(report.year);
+    ? ` (${MONTH_NAMES[report.month - 1]} ${report.yearTo})`
+    : "";
 
   const lines: string[] = [];
   lines.push(`Reference + dial: ${report.reference} · dial ${report.dial}`);
-  lines.push(`Year: ${monthLabel}`);
+  lines.push(`${report.yearFrom === report.yearTo ? "Year" : "Years"}: ${years}${monthLabel}`);
   lines.push("");
   lines.push("B2B:");
   for (const entry of report.b2b) {
@@ -430,6 +440,11 @@ export function formatReportText(report: ResearchReport): string {
     lines.push(
       `      lowest UAE: ${uae ? formatMoney(uae.price, uae.currency) : "PENDING"}`,
     );
+  }
+
+  if (extra.length) {
+    lines.push("");
+    lines.push(...extra);
   }
 
   lines.push("");

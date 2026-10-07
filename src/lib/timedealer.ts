@@ -1,4 +1,5 @@
 import CryptoJS from "crypto-js";
+import { toUsd } from "@/lib/deal";
 import { fetchWithTimeout, isAbortError, timeLeft } from "@/lib/http";
 import {
   dropPriceOutliers,
@@ -20,6 +21,8 @@ export type TimeDealerYearResult = {
   quotes: B2BQuote[];
   totalFound: number;
   dealerCount: number;
+  /** USD value of every listing seen, for market stats. */
+  sampleUsd?: number[];
   /** The feed has posts between the cheapest and priciest pages we read. */
   moreAvailable?: boolean;
   error?: string;
@@ -125,7 +128,10 @@ export async function loginTimeDealer(opts: {
     if (!res.ok || String(json.code) !== "200") {
       return {
         cookie: "",
-        error: `TimeDealer login failed: ${json.message || res.status}`,
+        error:
+          json.message === "MAX_DESKTOP_EXCEED"
+            ? "TimeDealer's desktop device limit is full — remove a computer at timedealer.io/account/device (logging out isn't enough), keeping \"WatchPriceResearch\"."
+            : `TimeDealer login failed: ${json.message || res.status}`,
       };
     }
     const cookie = cookieJarFromResponse(res);
@@ -443,6 +449,10 @@ export async function searchTimeDealerForSale(opts: {
   return {
     quotes: pickDisplayQuotes(listings),
     totalFound: listings.length,
+    sampleUsd: listings
+      .map((q) => q.usdPrice ?? toUsd(q.price, q.currency))
+      .filter((n): n is number => n !== null)
+      .sort((a, b) => a - b),
     dealerCount: new Set(listings.map((q) => q.sellerPhone || q.seller || q.id)).size,
     // Two full pages may not meet in the middle.
     moreAvailable: cheapest.full && priciest.full && items.size >= FEED_PAGE_SIZE * 2,

@@ -10,7 +10,7 @@
     "build": "next build",
     "start": "next start --hostname 0.0.0.0 --port ${PORT:-43127}",
     "lint": "eslint",
-    "test": "tsx --test src/lib/watch-research.test.ts"
+    "test": "tsx --test src/lib/watch-research.test.ts src/lib/deal.test.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",

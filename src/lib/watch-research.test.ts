@@ -9,6 +9,7 @@ import {
   dropPriceOutliers,
   extractDialHint,
   formatReportText,
+  legacyYearRange,
   normalizeReference,
   pickDisplayQuotes,
   type B2BQuote,
@@ -51,34 +52,33 @@ describe("extractDialHint", () => {
 });
 
 describe("buildYearPlan", () => {
-  it("for the current year checks it and the year before, and flags month", () => {
-    const plan = buildYearPlan(2026, 3, 2026);
-    assert.deepEqual(plan.yearsToCheck, [2026, 2025]);
+  it("checks every year in the range, newest first", () => {
+    const plan = buildYearPlan(2022, 2026, null, 2026);
+    assert.deepEqual(plan.yearsToCheck, [2026, 2025, 2024, 2023, 2022]);
+    assert.equal(plan.yearFrom, 2022);
+    assert.equal(plan.yearTo, 2026);
+  });
+
+  it("swaps a reversed range and handles a single year", () => {
+    assert.deepEqual(buildYearPlan(2026, 2025, null, 2026).yearsToCheck, [2026, 2025]);
+    assert.deepEqual(buildYearPlan(2024, 2024, null, 2026).yearsToCheck, [2024]);
+  });
+
+  it("flags month freshness only when the range reaches the current year", () => {
+    const plan = buildYearPlan(2025, 2026, 3, 2026);
     assert.equal(plan.monthMatters, true);
     assert.equal(plan.ourMonth, 3);
+    assert.ok(plan.rules.some((r) => /Target month: March 2026/.test(r)));
+    assert.equal(buildYearPlan(2023, 2024, null, 2026).monthMatters, false);
   });
+});
 
-  it("does not require a month for the current year", () => {
-    const plan = buildYearPlan(2026, null, 2026);
-    assert.deepEqual(plan.yearsToCheck, [2026, 2025]);
-    assert.equal(plan.ourMonth, null);
-    assert.ok(plan.rules.every((r) => !/enter the production month/i.test(r)));
-  });
-
-  it("for the previous two years checks those two only", () => {
-    assert.deepEqual(buildYearPlan(2025, null, 2026).yearsToCheck, [2024, 2025]);
-    assert.deepEqual(buildYearPlan(2024, null, 2026).yearsToCheck, [2024, 2025]);
-    assert.equal(buildYearPlan(2025, null, 2026).monthMatters, false);
-  });
-
-  it("rolls forward with the calendar (2027)", () => {
-    assert.deepEqual(buildYearPlan(2027, 1, 2027).yearsToCheck, [2027, 2026]);
-    assert.equal(buildYearPlan(2027, 1, 2027).monthMatters, true);
-    assert.deepEqual(buildYearPlan(2026, null, 2027).yearsToCheck, [2025, 2026]);
-  });
-
-  it("keeps a month given for older years", () => {
-    assert.equal(buildYearPlan(2024, 7, 2026).ourMonth, 7);
+describe("legacyYearRange", () => {
+  it("maps old ?year= links to the original comparison rule", () => {
+    assert.deepEqual(legacyYearRange(2026, 2026), { yearFrom: 2025, yearTo: 2026 });
+    assert.deepEqual(legacyYearRange(2025, 2026), { yearFrom: 2024, yearTo: 2025 });
+    assert.deepEqual(legacyYearRange(2024, 2026), { yearFrom: 2024, yearTo: 2025 });
+    assert.deepEqual(legacyYearRange(2019, 2026), { yearFrom: 2018, yearTo: 2019 });
   });
 });
 
@@ -287,7 +287,8 @@ describe("formatReportText", () => {
   it("includes reference, years, and pending markers", () => {
     const report = buildEmptyReport({
       reference: "7118/1200A-010",
-      year: 2025,
+      yearFrom: 2024,
+      yearTo: 2025,
     });
     const text = formatReportText(report);
     assert.match(text, /7118\/1200A-010/);
@@ -298,7 +299,7 @@ describe("formatReportText", () => {
 
   it("lists the 3 lowest and the highest dealer quotes with sellers, HKD kept in HKD", () => {
     const report = buildEmptyReport(
-      { reference: "7118/1200A-010", year: 2026, month: 3 },
+      { reference: "7118/1200A-010", yearFrom: 2025, yearTo: 2026, month: 3 },
       2026,
     );
     report.b2b[0] = {
@@ -321,7 +322,7 @@ describe("formatReportText", () => {
       ],
     };
     const text = formatReportText(report);
-    assert.match(text, /Year: 2026 \(March\)/);
+    assert.match(text, /Years: 2025–2026 \(March 2026\)/);
     assert.match(text, /2026\/03: 24 listings from 17 dealers/);
     assert.match(text, /lowest: +HK\$1,450,000 · Dealer A · HK Group · dated 2026-03/);
     assert.match(text, /#2: +HK\$1,480,000 · Dealer B/);

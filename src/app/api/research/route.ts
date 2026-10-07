@@ -6,8 +6,9 @@ import {
 } from "@/lib/chrono24";
 import { fetchTimeDealerQuotes } from "@/lib/timedealer";
 import {
+  MAX_YEAR_SPAN,
   buildEmptyReport,
-  type ResearchInput,
+  legacyYearRange,
   type ResearchReport,
 } from "@/lib/watch-research";
 
@@ -17,7 +18,14 @@ export const maxDuration = 60;
 /** Providers must finish inside this, leaving headroom under maxDuration. */
 const PROVIDER_BUDGET_MS = 50_000;
 
-type Body = ResearchInput & {
+type Body = {
+  reference?: string;
+  yearFrom?: number | string;
+  yearTo?: number | string;
+  /** Legacy single year: mapped to the team's original comparison rule. */
+  year?: number | string;
+  month?: number | string | null;
+  dial?: string;
   reefApiKey?: string;
   autoFetchB2C?: boolean;
   autoFetchB2B?: boolean;
@@ -61,6 +69,7 @@ async function fillB2B(report: ResearchReport, deadline: number): Promise<void> 
       quotes: found.quotes,
       totalFound: found.totalFound,
       dealerCount: found.dealerCount,
+      sampleUsd: found.sampleUsd,
       moreAvailable: found.moreAvailable,
     };
   });
@@ -93,6 +102,7 @@ async function fillB2C(
       bucket.highestWorld.listing = slice.highestWorld;
       bucket.lowestWorld.note = slice.note;
       bucket.highestWorld.note = slice.note;
+      bucket.retail = { total: slice.total, sampleUsd: slice.sampleUsd };
     }
     if (mode !== "prices") {
       bucket.lowestUae.listing = slice.lowestUae;
@@ -112,13 +122,33 @@ export async function POST(req: Request) {
   }
 
   const reference = (body.reference ?? "").trim();
-  const year = Number(body.year);
   if (!reference) {
     return NextResponse.json({ error: "Reference is required" }, { status: 400 });
   }
-  if (!Number.isFinite(year) || year < 1990 || year > 2035) {
+  const range =
+    body.yearFrom !== undefined || body.yearTo !== undefined
+      ? {
+          yearFrom: Number(body.yearFrom ?? body.yearTo),
+          yearTo: Number(body.yearTo ?? body.yearFrom),
+        }
+      : legacyYearRange(Number(body.year));
+  const { yearFrom, yearTo } = range;
+  const validYear = (y: number) => Number.isInteger(y) && y >= 1990 && y <= 2035;
+  if (!validYear(yearFrom) || !validYear(yearTo)) {
     return NextResponse.json(
-      { error: "Year must be between 1990 and 2035" },
+      { error: "Years must be between 1990 and 2035" },
+      { status: 400 },
+    );
+  }
+  if (yearFrom > yearTo) {
+    return NextResponse.json(
+      { error: "\"Year from\" must not be after \"Year to\"" },
+      { status: 400 },
+    );
+  }
+  if (yearTo - yearFrom + 1 > MAX_YEAR_SPAN) {
+    return NextResponse.json(
+      { error: `Pick at most ${MAX_YEAR_SPAN} years at once` },
       { status: 400 },
     );
   }
@@ -136,7 +166,8 @@ export async function POST(req: Request) {
 
   const report: ResearchReport = buildEmptyReport({
     reference,
-    year,
+    yearFrom,
+    yearTo,
     month,
     dial: body.dial,
   });
