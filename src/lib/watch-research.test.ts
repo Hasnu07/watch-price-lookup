@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { parseChrono24Year, sanitizeApiError, yearPricesFromSearch } from "./chrono24";
+import { USD_RATES } from "./deal";
 import { parseTimeDealerItems } from "./timedealer";
 import {
   buildEmptyReport,
@@ -225,7 +226,7 @@ describe("parseTimeDealerItems", () => {
         { item_id: 3, ref: "7118/1200A-011", price: 1_300_000, release_date: "2025-01" },
         { item_id: 4, ref: "7118/1200A-010", price: 0, release_date: "2025-01" },
       ],
-      { reference: "7118/1200A-010", year: 2025 },
+      { reference: "7118/1200A-010", year: 2025, usdRates: USD_RATES },
     );
     assert.equal(quotes.length, 1);
     const [q] = quotes;
@@ -266,7 +267,7 @@ describe("parseTimeDealerItems reposts + currency", () => {
         post(5, { sender_phone: "85290000000", sender_name: "Ryan" }),
         post(6, { currency: "USD", price: 13_500, usd_price: 13_500, sender_phone: "1555" }),
       ],
-      { reference: "126610LN", year: 2024 },
+      { reference: "126610LN", year: 2024, usdRates: USD_RATES },
     );
     const summary = quotes.map(
       (q) => `${q.seller} ${q.currency} ${q.price} ×${q.timesPosted ?? 1}`,
@@ -280,6 +281,39 @@ describe("parseTimeDealerItems reposts + currency", () => {
     const merged = quotes[0]!;
     assert.equal(merged.releaseDate, "2024-08"); // keeps the more specific date
     assert.equal(merged.postedAt, "2026-07-03T10:00:00.000Z"); // latest post
+  });
+});
+
+describe("parseTimeDealerItems currencies", () => {
+  // Live 126610LN 2024 feed, 2026-10-13: EUR quotes arrive as "EURO" with usd_price 0.
+  const item = (id: number, price: number, currency: string, usd: number) => ({
+    item_id: id,
+    ref: "126610LN-0001",
+    price,
+    currency,
+    usd_price: usd,
+    release_date: "2024",
+    sender_phone: `phone-${id}`,
+    condition: "used",
+  });
+
+  it("values EURO quotes at ECB rates instead of ranking them as dollars", () => {
+    const quotes = parseTimeDealerItems(
+      [
+        item(1, 11_850, "EURO", 0),
+        item(2, 99_000, "HKD", 12_614),
+        item(3, 12_400, "USD", 12_400),
+        item(4, 12_000, "CHF", 0), // no rate for CHF here → left out
+      ],
+      { reference: "126610LN", year: 2024, usdRates: { ...USD_RATES, EUR: 0.89437 } },
+    );
+    assert.deepEqual(
+      quotes.map((q) => `${q.price} ${q.currency}`),
+      ["12400 USD", "99000 HKD", "11850 EUR"],
+    );
+    const eur = quotes[2]!;
+    assert.equal(Math.round(eur.usdPrice!), 13_250);
+    assert.equal(eur.usdFromEcb, true);
   });
 });
 

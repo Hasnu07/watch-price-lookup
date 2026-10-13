@@ -252,7 +252,8 @@ function QuoteCard({
           </p>
           {quote.usdPrice && quote.currency !== "USD" ? (
             <p className="text-xs tabular-nums text-ink/55">
-              ≈ {formatMoney(quote.usdPrice, "USD")} at TimeDealer rate
+              ≈ {formatMoney(quote.usdPrice, "USD")} at{" "}
+              {quote.usdFromEcb ? "ECB" : "TimeDealer"} rate
             </p>
           ) : null}
         </div>

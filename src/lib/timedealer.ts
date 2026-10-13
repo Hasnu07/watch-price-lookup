@@ -1,5 +1,6 @@
 import CryptoJS from "crypto-js";
 import { toUsd } from "@/lib/deal";
+import { getUsdRates, type UsdRates } from "@/lib/fx";
 import { fetchWithTimeout, isAbortError, timeLeft } from "@/lib/http";
 import {
   dropPriceOutliers,
@@ -224,6 +225,22 @@ function toIsoTime(value: string | number | null | undefined): string | null {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
+/** Dealers type currencies loosely; map them to ISO codes so prices format right. */
+const CURRENCY_ALIASES: Record<string, string> = {
+  EURO: "EUR",
+  EUROS: "EUR",
+  "€": "EUR",
+  RMB: "CNY",
+  "HK$": "HKD",
+  "US$": "USD",
+  $: "USD",
+};
+
+function normalizeCurrency(raw: string | null | undefined): string {
+  const code = String(raw || "HKD").trim().toUpperCase();
+  return CURRENCY_ALIASES[code] ?? code;
+}
+
 function toQuote(raw: RawItem): B2BQuote | null {
   const price = Number(raw.price ?? raw.r_price ?? raw.amount);
   if (!Number.isFinite(price) || price <= 0) return null;
@@ -233,7 +250,7 @@ function toQuote(raw: RawItem): B2BQuote | null {
     id: String(raw.item_id ?? `${raw.ref}-${price}-${raw.sender_phone ?? ""}`),
     reference: String(raw.ref ?? ""),
     price,
-    currency: String(raw.currency || "HKD").toUpperCase(),
+    currency: normalizeCurrency(raw.currency),
     usdPrice: Number.isFinite(usdPrice) && usdPrice > 0 ? usdPrice : null,
     releaseDate: text(raw.release_date),
     postedAt: toIsoTime(raw.posted_time),
@@ -300,10 +317,22 @@ function mergeReposts(quotes: B2BQuote[]): B2BQuote[] {
   return [...byKey.values()];
 }
 
+/**
+ * TimeDealer gives no usd_price for some currencies (EUR quotes come back
+ * with 0), which would rank €11,850 as if it were $11,850. Fill those from
+ * ECB rates; a quote we still can't value is dropped rather than misranked.
+ */
+function withUsdValue(quote: B2BQuote, usdRates: UsdRates): B2BQuote | null {
+  if (quote.usdPrice) return quote;
+  if (quote.currency === "USD") return { ...quote, usdPrice: quote.price };
+  const rate = usdRates[quote.currency];
+  return rate ? { ...quote, usdPrice: quote.price / rate, usdFromEcb: true } : null;
+}
+
 /** Map raw feed items to quotes for one reference + year, sorted for display. */
 export function parseTimeDealerItems(
   items: RawItem[],
-  opts: { reference: string; year: number },
+  opts: { reference: string; year: number; usdRates: UsdRates },
 ): B2BQuote[] {
   const ref = opts.reference.toUpperCase();
   return sortQuotes(
@@ -312,6 +341,8 @@ export function parseTimeDealerItems(
         .map(toQuote)
         .filter((q): q is B2BQuote => Boolean(q))
         .map(fixMislabelledHkd)
+        .map((q) => withUsdValue(q, opts.usdRates))
+        .filter((q): q is B2BQuote => Boolean(q))
         .filter((q) => q.reference.toUpperCase().includes(ref))
         .filter((q) => Boolean(q.releaseDate?.startsWith(String(opts.year)))),
     ),
@@ -424,6 +455,7 @@ export async function searchTimeDealerForSale(opts: {
   reference: string;
   year: number;
   deadline: number;
+  usdRates: UsdRates;
 }): Promise<TimeDealerYearResult> {
   const [cheapest, priciest] = await Promise.all([
     fetchFeedPage({ ...opts, sort: "asc" }),
@@ -465,7 +497,10 @@ export async function fetchTimeDealerQuotes(opts: {
   years: number[];
   deadline: number;
 }): Promise<TimeDealerQuotes> {
+  // Fetched alongside the login; cached for 12h, pegs only if it fails.
+  const usdRatesPromise = getUsdRates(opts.deadline);
   async function searchAll(cookie: string) {
+    const usdRates = await usdRatesPromise;
     const results = await Promise.all(
       opts.years.map((year) =>
         searchTimeDealerForSale({
@@ -473,6 +508,7 @@ export async function fetchTimeDealerQuotes(opts: {
           reference: opts.reference,
           year,
           deadline: opts.deadline,
+          usdRates,
         }),
       ),
     );

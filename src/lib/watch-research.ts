@@ -57,6 +57,8 @@ export type B2BQuote = {
   image: string | null;
   verified: boolean;
   timesPosted: number | null;
+  /** usdPrice came from ECB rates because TimeDealer gave none. */
+  usdFromEcb?: boolean;
 };
 
 export type B2BYear = {
